@@ -331,3 +331,88 @@ func TestDetectVisionContent_NoMessages(t *testing.T) {
 		t.Fatal("expected no vision content when messages field is absent")
 	}
 }
+
+func TestMergeToolResultBlocks(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "tool_result + text merge",
+			input:    `{"messages":[{"role":"user","content":[{"type":"tool_result","content":"A","tool_use_id":"123"},{"type":"text","text":"B"}]}]}`,
+			expected: `{"messages":[{"role":"user","content":[{"type":"tool_result","content":"A\n\nPlease execute skill now:B","tool_use_id":"123"}]}]}`,
+		},
+		{
+			name:     "multiple text blocks merge",
+			input:    `{"messages":[{"role":"user","content":[{"type":"tool_result","content":"A","tool_use_id":"123"},{"type":"text","text":"B"},{"type":"text","text":"C"}]}]}`,
+			expected: `{"messages":[{"role":"user","content":[{"type":"tool_result","content":"A\n\nPlease execute skill now:B\n\nPlease execute skill now:C","tool_use_id":"123"}]}]}`,
+		},
+		{
+			name:     "no tool_result no processing",
+			input:    `{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`,
+			expected: `{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`,
+		},
+		{
+			name:     "string content no processing",
+			input:    `{"messages":[{"role":"user","content":"hello"}]}`,
+			expected: `{"messages":[{"role":"user","content":"hello"}]}`,
+		},
+		{
+			name:     "tool_result with array content",
+			input:    `{"messages":[{"role":"user","content":[{"type":"tool_result","content":[{"type":"text","text":"A"}],"tool_use_id":"123"},{"type":"text","text":"B"}]}]}`,
+			expected: `{"messages":[{"role":"user","content":[{"type":"tool_result","content":"A\n\nPlease execute skill now:B","tool_use_id":"123"}]}]}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mergeToolResultBlocks([]byte(tt.input))
+			if string(got) != tt.expected {
+				t.Errorf("mergeToolResultBlocks() = %s, want %s", string(got), tt.expected)
+			}
+		})
+	}
+}
+
+func TestTransformAllUserToDeveloper(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "single user transform",
+			input:    `{"messages":[{"role":"user","content":"hello"}]}`,
+			expected: `{"messages":[{"role":"developer","content":"[user request] hello"}]}`,
+		},
+		{
+			name:     "multiple user transform",
+			input:    `{"messages":[{"role":"user","content":"hello"},{"role":"user","content":"world"}]}`,
+			expected: `{"messages":[{"role":"developer","content":"[user request] hello"},{"role":"developer","content":"[user request] world"}]}`,
+		},
+		{
+			name:     "mixed messages transform only user",
+			input:    `{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"answer"},{"role":"user","content":"followup"}]}`,
+			expected: `{"messages":[{"role":"developer","content":"[user request] hello"},{"role":"assistant","content":"answer"},{"role":"developer","content":"[user request] followup"}]}`,
+		},
+		{
+			name:     "array content transform",
+			input:    `{"messages":[{"role":"user","content":[{"type":"text","text":"hello"},{"type":"text","text":"world"}]}]}`,
+			expected: `{"messages":[{"role":"developer","content":"[user request] hello\nworld"}]}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := transformAllUserToDeveloper([]byte(tt.input))
+			if string(got) != tt.expected {
+				t.Errorf("transformAllUserToDeveloper() = %s, want %s", string(got), tt.expected)
+			}
+		})
+	}
+}

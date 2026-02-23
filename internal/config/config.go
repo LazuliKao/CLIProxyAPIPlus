@@ -130,6 +130,7 @@ type Config struct {
 	// This is useful when you want to login with a different account without logging out
 	// from your current session. Default: false.
 	IncognitoBrowser bool `yaml:"incognito-browser" json:"incognito-browser"`
+	Copilot CopilotConfig `yaml:"copilot,omitempty" json:"copilot,omitempty"`
 
 	legacyMigrationPending bool `yaml:"-" json:"-"`
 }
@@ -318,6 +319,14 @@ type CloakConfig struct {
 	// CacheUserID controls whether Claude user_id values are cached per API key.
 	// When false, a fresh random user_id is generated for every request.
 	CacheUserID *bool `yaml:"cache-user-id,omitempty" json:"cache-user-id,omitempty"`
+}
+
+// CopilotConfig configures Copilot Premium optimization features.
+type CopilotConfig struct {
+	// MergeToolBlocks enables merging tool_result and text blocks.
+	MergeToolBlocks bool `yaml:"merge-tool-blocks,omitempty" json:"merge-tool-blocks,omitempty"`
+	// TransformUserToDeveloper enables transforming user messages to developer messages.
+	TransformUserToDeveloper bool `yaml:"transform-user-to-developer,omitempty" json:"transform-user-to-developer,omitempty"`
 }
 
 // ClaudeKey represents the configuration for a Claude API key,
@@ -596,6 +605,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	cfg.IncognitoBrowser = false // Default to normal browser (AWS uses incognito by force)
+	cfg.Copilot.MergeToolBlocks = true
+	cfg.Copilot.TransformUserToDeveloper = false
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
@@ -1343,6 +1354,14 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 			return node.Value == DefaultPanelGitHubRepository
 		case "routing.strategy":
 			return node.Value == "round-robin"
+		}
+	}
+
+	// Check boolean defaults
+	if node.Kind == yaml.ScalarNode && node.Tag == "!!bool" {
+		switch fullPath {
+		case "copilot.merge-tool-blocks":
+			return node.Value == "true"
 		}
 	}
 

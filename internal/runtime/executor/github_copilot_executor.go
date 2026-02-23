@@ -125,6 +125,12 @@ func (e *GitHubCopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
 	body = e.normalizeModel(req.Model, body)
 	body = flattenAssistantContent(body)
+	if e.cfg.Copilot.MergeToolBlocks {
+		body = mergeToolResultBlocks(body)
+	}
+	if e.cfg.Copilot.TransformUserToDeveloper {
+		body = transformAllUserToDeveloper(body)
+	}
 
 	// Detect vision content before input normalization removes messages
 	hasVision := detectVisionContent(body)
@@ -255,6 +261,12 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
 	body = e.normalizeModel(req.Model, body)
 	body = flattenAssistantContent(body)
+	if e.cfg.Copilot.MergeToolBlocks {
+		body = mergeToolResultBlocks(body)
+	}
+	if e.cfg.Copilot.TransformUserToDeveloper {
+		body = transformAllUserToDeveloper(body)
+	}
 
 	// Detect vision content before input normalization removes messages
 	hasVision := detectVisionContent(body)
@@ -1235,4 +1247,124 @@ func translateGitHubCopilotResponsesStreamToClaude(line []byte, param *any) []st
 // isHTTPSuccess checks if the status code indicates success (2xx).
 func isHTTPSuccess(statusCode int) bool {
 	return statusCode >= 200 && statusCode < 300
+}
+
+// mergeToolResultBlocks merges tool_result and text blocks in user messages
+// to reduce GitHub Copilot Premium request billing.
+func mergeToolResultBlocks(body []byte) []byte {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body
+	}
+	result := body
+	for i, msg := range messages.Array() {
+		if msg.Get("role").String() != "user" {
+			continue
+		}
+		content := msg.Get("content")
+		if !content.Exists() || !content.IsArray() {
+			continue
+		}
+
+		var toolResultIdx = -1
+		var textBlocks []gjson.Result
+
+		contentArray := content.Array()
+		for j, block := range contentArray {
+			blockType := block.Get("type").String()
+			if blockType == "tool_result" && toolResultIdx == -1 {
+				toolResultIdx = j
+			} else if blockType == "text" {
+				textBlocks = append(textBlocks, block)
+			}
+		}
+
+		if toolResultIdx != -1 && len(textBlocks) > 0 {
+			toolResultBlock := contentArray[toolResultIdx]
+			toolResultContent := toolResultBlock.Get("content")
+
+			var mergedContent string
+			if toolResultContent.IsArray() {
+				var parts []string
+				for _, part := range toolResultContent.Array() {
+					if part.Get("type").String() == "text" {
+						parts = append(parts, part.Get("text").String())
+					} else if part.Type == gjson.String {
+						parts = append(parts, part.String())
+					}
+				}
+				mergedContent = strings.Join(parts, "\n")
+			} else {
+				mergedContent = toolResultContent.String()
+			}
+
+			for _, textBlock := range textBlocks {
+				text := textBlock.Get("text").String()
+				if text != "" {
+					mergedContent += "\n\nPlease execute skill now:" + text
+				}
+			}
+
+			// Rebuild content array
+			newContent := "[]"
+			for j, block := range contentArray {
+				blockType := block.Get("type").String()
+				if blockType == "text" {
+					continue
+				}
+				if j == toolResultIdx {
+					updatedBlock := block.Raw
+					updatedBlock, _ = sjson.Set(updatedBlock, "content", mergedContent)
+					newContent, _ = sjson.SetRaw(newContent, "-1", updatedBlock)
+				} else {
+					newContent, _ = sjson.SetRaw(newContent, "-1", block.Raw)
+				}
+			}
+
+			path := fmt.Sprintf("messages.%d.content", i)
+			result, _ = sjson.SetRawBytes(result, path, []byte(newContent))
+		}
+	}
+	return result
+}
+
+// transformAllUserToDeveloper converts all user messages to developer role
+// to avoid GitHub Copilot Premium request billing.
+func transformAllUserToDeveloper(body []byte) []byte {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body
+	}
+	result := body
+	for i, msg := range messages.Array() {
+		if msg.Get("role").String() != "user" {
+			continue
+		}
+
+		// Change role to developer
+		pathRole := fmt.Sprintf("messages.%d.role", i)
+		result, _ = sjson.SetBytes(result, pathRole, "developer")
+
+		content := msg.Get("content")
+		var newContent string
+		if content.Type == gjson.String {
+			newContent = "[user request] " + content.String()
+		} else if content.IsArray() {
+			var textParts []string
+			for _, part := range content.Array() {
+				if part.Get("type").String() == "text" {
+					if t := part.Get("text").String(); t != "" {
+						textParts = append(textParts, t)
+					}
+				}
+			}
+			newContent = "[user request] " + strings.Join(textParts, "\n")
+		} else {
+			newContent = "[user request] " + content.String()
+		}
+
+		pathContent := fmt.Sprintf("messages.%d.content", i)
+		result, _ = sjson.SetBytes(result, pathContent, newContent)
+	}
+	return result
 }
