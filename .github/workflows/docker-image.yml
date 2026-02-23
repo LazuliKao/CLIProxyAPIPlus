@@ -8,7 +8,6 @@ on:
 
 env:
   APP_NAME: CLIProxyAPI
-  GHCR_REPO: ghcr.io/${{ github.repository_owner }}/cli-proxy-api-plus
 
 permissions:
   contents: read
@@ -33,6 +32,10 @@ jobs:
           echo VERSION=`git describe --tags --always --dirty` >> $GITHUB_ENV
           echo COMMIT=`git rev-parse --short HEAD` >> $GITHUB_ENV
           echo BUILD_DATE=`date -u +%Y-%m-%dT%H:%M:%SZ` >> $GITHUB_ENV
+      - name: Normalize GHCR repository
+        run: |
+          OWNER_LC="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "GHCR_REPO=ghcr.io/${OWNER_LC}/cli-proxy-api-plus" >> $GITHUB_ENV
       - name: Build and push (amd64)
         uses: docker/build-push-action@v6
         with:
@@ -65,6 +68,10 @@ jobs:
           echo VERSION=`git describe --tags --always --dirty` >> $GITHUB_ENV
           echo COMMIT=`git rev-parse --short HEAD` >> $GITHUB_ENV
           echo BUILD_DATE=`date -u +%Y-%m-%dT%H:%M:%SZ` >> $GITHUB_ENV
+      - name: Normalize GHCR repository
+        run: |
+          OWNER_LC="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "GHCR_REPO=ghcr.io/${OWNER_LC}/cli-proxy-api-plus" >> $GITHUB_ENV
       - name: Build and push (arm64)
         uses: docker/build-push-action@v6
         with:
@@ -100,6 +107,10 @@ jobs:
           echo VERSION=`git describe --tags --always --dirty` >> $GITHUB_ENV
           echo COMMIT=`git rev-parse --short HEAD` >> $GITHUB_ENV
           echo BUILD_DATE=`date -u +%Y-%m-%dT%H:%M:%SZ` >> $GITHUB_ENV
+      - name: Normalize GHCR repository
+        run: |
+          OWNER_LC="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "GHCR_REPO=ghcr.io/${OWNER_LC}/cli-proxy-api-plus" >> $GITHUB_ENV
       - name: Create and push multi-arch manifests
         run: |
           docker buildx imagetools create \
