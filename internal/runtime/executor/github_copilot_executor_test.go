@@ -388,22 +388,27 @@ func TestTransformAllUserToDeveloper(t *testing.T) {
 		{
 			name:     "single user transform",
 			input:    `{"messages":[{"role":"user","content":"hello"}]}`,
-			expected: `{"messages":[{"role":"developer","content":"[user request] hello"}]}`,
+			expected: `{"messages":[{"role":"user","content":"hello"}]}`,
 		},
 		{
 			name:     "multiple user transform",
 			input:    `{"messages":[{"role":"user","content":"hello"},{"role":"user","content":"world"}]}`,
-			expected: `{"messages":[{"role":"developer","content":"[user request] hello"},{"role":"developer","content":"[user request] world"}]}`,
+			expected: `{"messages":[{"role":"user","content":"hello"},{"role":"developer","content":"[user request] world"}]}`,
 		},
 		{
 			name:     "mixed messages transform only user",
 			input:    `{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"answer"},{"role":"user","content":"followup"}]}`,
-			expected: `{"messages":[{"role":"developer","content":"[user request] hello"},{"role":"assistant","content":"answer"},{"role":"developer","content":"[user request] followup"}]}`,
+			expected: `{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"answer"},{"role":"developer","content":"[user request] followup"}]}`,
 		},
 		{
 			name:     "array content transform",
 			input:    `{"messages":[{"role":"user","content":[{"type":"text","text":"hello"},{"type":"text","text":"world"}]}]}`,
-			expected: `{"messages":[{"role":"developer","content":"[user request] hello\nworld"}]}`,
+			expected: `{"messages":[{"role":"user","content":[{"type":"text","text":"hello"},{"type":"text","text":"world"}]}]}`,
+		},
+		{
+			name:     "first user array preserved second transformed",
+			input:    `{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]},{"role":"user","content":[{"type":"text","text":"world"}]}]}`,
+			expected: `{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]},{"role":"developer","content":"[user request] world"}]}`,
 		},
 	}
 

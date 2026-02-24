@@ -1336,8 +1336,14 @@ func transformAllUserToDeveloper(body []byte) []byte {
 		return body
 	}
 	result := body
+	firstUserKept := false
 	for i, msg := range messages.Array() {
 		if msg.Get("role").String() != "user" {
+			continue
+		}
+
+		if !firstUserKept {
+			firstUserKept = true
 			continue
 		}
 
