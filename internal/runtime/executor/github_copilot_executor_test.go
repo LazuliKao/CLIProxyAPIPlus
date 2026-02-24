@@ -385,132 +385,102 @@ func TestTransformUserToToolResponse(t *testing.T) {
 		checkFunc func(t *testing.T, got []byte)
 	}{
 		{
-			name:  "single user no assistant - no transform",
+			name:  "single user no assistant unchanged",
 			input: `{"messages":[{"role":"user","content":"hello"}]}`,
 			checkFunc: func(t *testing.T, got []byte) {
 				if string(got) != `{"messages":[{"role":"user","content":"hello"}]}` {
-					t.Errorf("unexpected output: %s", string(got))
+					t.Fatalf("unexpected output: %s", string(got))
 				}
 			},
 		},
 		{
-			name:  "user after assistant - transform to tool_result format",
+			name:  "assistant gets tool_calls and follow-up user becomes tool",
 			input: `{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"answer"},{"role":"user","content":"followup"}]}`,
 			checkFunc: func(t *testing.T, got []byte) {
-				messages := gjson.GetBytes(got, "messages")
-				if !messages.IsArray() || len(messages.Array()) != 3 {
-					t.Fatal("expected 3 messages")
+				messages := gjson.GetBytes(got, "messages").Array()
+				if len(messages) != 3 {
+					t.Fatalf("messages len = %d, want 3", len(messages))
 				}
-				// First message: user, unchanged
-				if messages.Array()[0].Get("role").String() != "user" {
-					t.Error("first message should remain user")
+
+				if messages[0].Get("role").String() != "user" {
+					t.Fatal("first message should remain user")
 				}
-				// Second message: assistant with tool_use injected in content
-				assistant := messages.Array()[1]
+
+				assistant := messages[1]
 				if assistant.Get("role").String() != "assistant" {
-					t.Error("second message should be assistant")
+					t.Fatal("second message should be assistant")
 				}
-				content := assistant.Get("content")
-				if !content.IsArray() {
-					t.Fatal("assistant content should be array")
+				if assistant.Get("content").String() != "answer" {
+					t.Fatalf("assistant content = %q, want %q", assistant.Get("content").String(), "answer")
 				}
-				// Find tool_use block
-				var toolUseID string
-				for _, block := range content.Array() {
-					if block.Get("type").String() == "tool_use" {
-						toolUseID = block.Get("id").String()
-						if block.Get("name").String() != "ask_user" {
-							t.Error("tool_use name should be ask_user")
-						}
-						break
-					}
+				toolCalls := assistant.Get("tool_calls").Array()
+				if len(toolCalls) != 1 {
+					t.Fatalf("tool_calls len = %d, want 1", len(toolCalls))
 				}
-				if toolUseID == "" {
-					t.Fatal("no tool_use block found in assistant")
+				if toolCalls[0].Get("type").String() != "function" {
+					t.Fatalf("tool_calls[0].type = %q, want function", toolCalls[0].Get("type").String())
 				}
-				// Third message: still role="user" but content is tool_result
-				thirdMsg := messages.Array()[2]
-				if thirdMsg.Get("role").String() != "user" {
-					t.Error("third message should still be user role")
+				if toolCalls[0].Get("function.name").String() != "ask_user" {
+					t.Fatalf("function.name = %q, want ask_user", toolCalls[0].Get("function.name").String())
 				}
-				toolResultContent := thirdMsg.Get("content")
-				if !toolResultContent.IsArray() {
-					t.Fatal("user content should be array with tool_result")
+				callID := toolCalls[0].Get("id").String()
+				if callID == "" {
+					t.Fatal("tool call id should not be empty")
 				}
-				// Check tool_result structure
-				for _, block := range toolResultContent.Array() {
-					if block.Get("type").String() == "tool_result" {
-						if block.Get("tool_use_id").String() != toolUseID {
-							t.Error("tool_use_id should match tool_use id")
-						}
-					}
+
+				toolMsg := messages[2]
+				if toolMsg.Get("role").String() != "tool" {
+					t.Fatalf("third message role = %q, want tool", toolMsg.Get("role").String())
+				}
+				if toolMsg.Get("tool_call_id").String() != callID {
+					t.Fatal("tool_call_id should match assistant tool call id")
+				}
+				if toolMsg.Get("content").String() != "followup" {
+					t.Fatalf("tool content = %q, want %q", toolMsg.Get("content").String(), "followup")
 				}
 			},
 		},
 		{
-			name:  "multiple user after assistant - both transformed to tool_result",
+			name:  "multiple users after assistant become tool messages",
 			input: `{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"answer"},{"role":"user","content":"query1"},{"role":"user","content":"query2"}]}`,
 			checkFunc: func(t *testing.T, got []byte) {
-				messages := gjson.GetBytes(got, "messages")
-				if !messages.IsArray() || len(messages.Array()) != 4 {
-					t.Fatal("expected 4 messages")
+				messages := gjson.GetBytes(got, "messages").Array()
+				if len(messages) != 4 {
+					t.Fatalf("messages len = %d, want 4", len(messages))
 				}
-				// Check both users after assistant have tool_result content
+				toolCalls := messages[1].Get("tool_calls").Array()
+				if len(toolCalls) != 2 {
+					t.Fatalf("tool_calls len = %d, want 2", len(toolCalls))
+				}
 				for i := 2; i < 4; i++ {
-					msg := messages.Array()[i]
-					if msg.Get("role").String() != "user" {
-						t.Errorf("message %d should still be user role", i)
+					if messages[i].Get("role").String() != "tool" {
+						t.Fatalf("message %d role = %q, want tool", i, messages[i].Get("role").String())
 					}
-					content := msg.Get("content")
-					if !content.IsArray() {
-						t.Errorf("message %d content should be array", i)
-						continue
-					}
-					hasToolResult := false
-					for _, block := range content.Array() {
-						if block.Get("type").String() == "tool_result" {
-							hasToolResult = true
-							break
-						}
-					}
-					if !hasToolResult {
-						t.Errorf("message %d should have tool_result block", i)
+					if messages[i].Get("tool_call_id").String() == "" {
+						t.Fatalf("message %d missing tool_call_id", i)
 					}
 				}
 			},
 		},
 		{
-			name:  "array content after assistant - transform to tool_result",
+			name:  "array user content is flattened into tool text",
 			input: `{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"answer"},{"role":"user","content":[{"type":"text","text":"line1"},{"type":"text","text":"line2"}]}]}`,
 			checkFunc: func(t *testing.T, got []byte) {
-				messages := gjson.GetBytes(got, "messages")
-				thirdMsg := messages.Array()[2]
-				if thirdMsg.Get("role").String() != "user" {
-					t.Error("should still be user role")
+				messages := gjson.GetBytes(got, "messages").Array()
+				if len(messages) != 3 {
+					t.Fatalf("messages len = %d, want 3", len(messages))
 				}
-				content := thirdMsg.Get("content")
-				if !content.IsArray() {
-					t.Fatal("content should be array")
+				if messages[2].Get("role").String() != "tool" {
+					t.Fatalf("third message role = %q, want tool", messages[2].Get("role").String())
 				}
-				// Check tool_result contains both lines
-				for _, block := range content.Array() {
-					if block.Get("type").String() == "tool_result" {
-						innerContent := block.Get("content")
-						if innerContent.IsArray() {
-							for _, inner := range innerContent.Array() {
-								if inner.Get("type").String() == "text" {
-									text := inner.Get("text").String()
-									if !strings.Contains(text, "line1") && !strings.Contains(text, "line2") {
-										t.Error("tool_result should contain both lines")
-									}
-								}
-							}
-						}
-					}
+				text := messages[2].Get("content").String()
+				if !strings.Contains(text, "line1") || !strings.Contains(text, "line2") {
+					t.Fatalf("tool content = %q, want both lines", text)
 				}
 			},
 		},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := transformUserToToolResponse([]byte(tt.input))
