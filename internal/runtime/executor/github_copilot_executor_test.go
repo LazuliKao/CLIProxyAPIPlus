@@ -394,7 +394,7 @@ func TestTransformUserToToolResponse(t *testing.T) {
 			},
 		},
 		{
-			name:  "user after assistant - transform to tool with injected tool_use",
+			name:  "user after assistant - transform to tool_result format",
 			input: `{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"answer"},{"role":"user","content":"followup"}]}`,
 			checkFunc: func(t *testing.T, got []byte) {
 				messages := gjson.GetBytes(got, "messages")
@@ -405,7 +405,7 @@ func TestTransformUserToToolResponse(t *testing.T) {
 				if messages.Array()[0].Get("role").String() != "user" {
 					t.Error("first message should remain user")
 				}
-				// Second message: assistant with tool_use injected
+				// Second message: assistant with tool_use injected in content
 				assistant := messages.Array()[1]
 				if assistant.Get("role").String() != "assistant" {
 					t.Error("second message should be assistant")
@@ -428,51 +428,85 @@ func TestTransformUserToToolResponse(t *testing.T) {
 				if toolUseID == "" {
 					t.Fatal("no tool_use block found in assistant")
 				}
-				// Third message: tool response
-				tool := messages.Array()[2]
-				if tool.Get("role").String() != "tool" {
-					t.Error("third message should be tool")
+				// Third message: still role="user" but content is tool_result
+				thirdMsg := messages.Array()[2]
+				if thirdMsg.Get("role").String() != "user" {
+					t.Error("third message should still be user role")
 				}
-				if tool.Get("tool_call_id").String() != toolUseID {
-					t.Error("tool_call_id should match tool_use id")
+				toolResultContent := thirdMsg.Get("content")
+				if !toolResultContent.IsArray() {
+					t.Fatal("user content should be array with tool_result")
 				}
-				if !strings.Contains(tool.Get("content").String(), "User's response:") {
-					t.Error("tool content should contain 'User's response:'")
+				// Check tool_result structure
+				for _, block := range toolResultContent.Array() {
+					if block.Get("type").String() == "tool_result" {
+						if block.Get("tool_use_id").String() != toolUseID {
+							t.Error("tool_use_id should match tool_use id")
+						}
+					}
 				}
 			},
 		},
 		{
-			name:  "multiple user after assistant - both transformed",
+			name:  "multiple user after assistant - both transformed to tool_result",
 			input: `{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"answer"},{"role":"user","content":"query1"},{"role":"user","content":"query2"}]}`,
 			checkFunc: func(t *testing.T, got []byte) {
 				messages := gjson.GetBytes(got, "messages")
 				if !messages.IsArray() || len(messages.Array()) != 4 {
 					t.Fatal("expected 4 messages")
 				}
-				// Check both users after assistant are transformed
+				// Check both users after assistant have tool_result content
 				for i := 2; i < 4; i++ {
 					msg := messages.Array()[i]
-					if msg.Get("role").String() != "tool" {
-						t.Errorf("message %d should be tool", i)
+					if msg.Get("role").String() != "user" {
+						t.Errorf("message %d should still be user role", i)
 					}
-					if msg.Get("tool_call_id").String() == "" {
-						t.Errorf("message %d should have tool_call_id", i)
+					content := msg.Get("content")
+					if !content.IsArray() {
+						t.Errorf("message %d content should be array", i)
+						continue
+					}
+					hasToolResult := false
+					for _, block := range content.Array() {
+						if block.Get("type").String() == "tool_result" {
+							hasToolResult = true
+							break
+						}
+					}
+					if !hasToolResult {
+						t.Errorf("message %d should have tool_result block", i)
 					}
 				}
 			},
 		},
 		{
-			name:  "array content after assistant - transform to tool",
+			name:  "array content after assistant - transform to tool_result",
 			input: `{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"answer"},{"role":"user","content":[{"type":"text","text":"line1"},{"type":"text","text":"line2"}]}]}`,
 			checkFunc: func(t *testing.T, got []byte) {
 				messages := gjson.GetBytes(got, "messages")
-				tool := messages.Array()[2]
-				if tool.Get("role").String() != "tool" {
-					t.Error("should be tool")
+				thirdMsg := messages.Array()[2]
+				if thirdMsg.Get("role").String() != "user" {
+					t.Error("should still be user role")
 				}
-				content := tool.Get("content").String()
-				if !strings.Contains(content, "line1") || !strings.Contains(content, "line2") {
-					t.Error("content should contain both lines")
+				content := thirdMsg.Get("content")
+				if !content.IsArray() {
+					t.Fatal("content should be array")
+				}
+				// Check tool_result contains both lines
+				for _, block := range content.Array() {
+					if block.Get("type").String() == "tool_result" {
+						innerContent := block.Get("content")
+						if innerContent.IsArray() {
+							for _, inner := range innerContent.Array() {
+								if inner.Get("type").String() == "text" {
+									text := inner.Get("text").String()
+									if !strings.Contains(text, "line1") && !strings.Contains(text, "line2") {
+										t.Error("tool_result should contain both lines")
+									}
+								}
+							}
+						}
+					}
 				}
 			},
 		},

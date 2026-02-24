@@ -1428,13 +1428,15 @@ func transformUserToToolResponse(body []byte) []byte {
 		result, _ = sjson.SetBytes(result, pathContent, newContent)
 	}
 
-	// Transform user messages to tool responses
+	// Transform user messages content to tool_result format
+	// Keep role as "user" but change content structure
 	for _, t := range transforms {
 		userMsg := arr[t.userIndex]
 		content := userMsg.Get("content")
-		var newContent string
+		// Build the text content
+		var textContent string
 		if content.Type == gjson.String {
-			newContent = "User's response: " + content.String()
+			textContent = content.String()
 		} else if content.IsArray() {
 			var textParts []string
 			for _, part := range content.Array() {
@@ -1444,18 +1446,27 @@ func transformUserToToolResponse(body []byte) []byte {
 					}
 				}
 			}
-			newContent = "User's response: " + strings.Join(textParts, "\n")
+			textContent = strings.Join(textParts, "\n")
 		} else {
-			newContent = "User's response: " + content.String()
+			textContent = content.String()
 		}
 
-		pathRole := fmt.Sprintf("messages.%d.role", t.userIndex)
-		result, _ = sjson.SetBytes(result, pathRole, "tool")
-		pathToolCallID := fmt.Sprintf("messages.%d.tool_call_id", t.userIndex)
-		result, _ = sjson.SetBytes(result, pathToolCallID, t.toolCallID)
-
+		// Create tool_result content array
+		toolResultContent := []map[string]interface{}{
+			{
+				"type":        "tool_result",
+				"tool_use_id": t.toolCallID,
+				"content": []map[string]interface{}{
+					{
+						"type": "text",
+						"text": textContent,
+					},
+				},
+				"is_error": false,
+			},
+		}
 		pathContent := fmt.Sprintf("messages.%d.content", t.userIndex)
-		result, _ = sjson.SetBytes(result, pathContent, newContent)
+		result, _ = sjson.SetBytes(result, pathContent, toolResultContent)
 	}
 	return result
 }
