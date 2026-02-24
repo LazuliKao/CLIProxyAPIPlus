@@ -377,47 +377,110 @@ func TestMergeToolResultBlocks(t *testing.T) {
 	}
 }
 
-func TestTransformAllUserToDeveloper(t *testing.T) {
+func TestTransformUserToToolResponse(t *testing.T) {
 	t.Parallel()
-
 	tests := []struct {
-		name     string
-		input    string
-		expected string
+		name      string
+		input     string
+		checkFunc func(t *testing.T, got []byte)
 	}{
 		{
-			name:     "single user transform",
-			input:    `{"messages":[{"role":"user","content":"hello"}]}`,
-			expected: `{"messages":[{"role":"user","content":"hello"}]}`,
+			name:  "single user no assistant - no transform",
+			input: `{"messages":[{"role":"user","content":"hello"}]}`,
+			checkFunc: func(t *testing.T, got []byte) {
+				if string(got) != `{"messages":[{"role":"user","content":"hello"}]}` {
+					t.Errorf("unexpected output: %s", string(got))
+				}
+			},
 		},
 		{
-			name:     "multiple user transform",
-			input:    `{"messages":[{"role":"user","content":"hello"},{"role":"user","content":"world"}]}`,
-			expected: `{"messages":[{"role":"user","content":"hello"},{"role":"developer","content":"[user request] world"}]}`,
+			name:  "user after assistant - transform to tool with injected tool_use",
+			input: `{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"answer"},{"role":"user","content":"followup"}]}`,
+			checkFunc: func(t *testing.T, got []byte) {
+				messages := gjson.GetBytes(got, "messages")
+				if !messages.IsArray() || len(messages.Array()) != 3 {
+					t.Fatal("expected 3 messages")
+				}
+				// First message: user, unchanged
+				if messages.Array()[0].Get("role").String() != "user" {
+					t.Error("first message should remain user")
+				}
+				// Second message: assistant with tool_use injected
+				assistant := messages.Array()[1]
+				if assistant.Get("role").String() != "assistant" {
+					t.Error("second message should be assistant")
+				}
+				content := assistant.Get("content")
+				if !content.IsArray() {
+					t.Fatal("assistant content should be array")
+				}
+				// Find tool_use block
+				var toolUseID string
+				for _, block := range content.Array() {
+					if block.Get("type").String() == "tool_use" {
+						toolUseID = block.Get("id").String()
+						if block.Get("name").String() != "ask_user" {
+							t.Error("tool_use name should be ask_user")
+						}
+						break
+					}
+				}
+				if toolUseID == "" {
+					t.Fatal("no tool_use block found in assistant")
+				}
+				// Third message: tool response
+				tool := messages.Array()[2]
+				if tool.Get("role").String() != "tool" {
+					t.Error("third message should be tool")
+				}
+				if tool.Get("tool_call_id").String() != toolUseID {
+					t.Error("tool_call_id should match tool_use id")
+				}
+				if !strings.Contains(tool.Get("content").String(), "User's response:") {
+					t.Error("tool content should contain 'User's response:'")
+				}
+			},
 		},
 		{
-			name:     "mixed messages transform only user",
-			input:    `{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"answer"},{"role":"user","content":"followup"}]}`,
-			expected: `{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"answer"},{"role":"developer","content":"[user request] followup"}]}`,
+			name:  "multiple user after assistant - both transformed",
+			input: `{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"answer"},{"role":"user","content":"query1"},{"role":"user","content":"query2"}]}`,
+			checkFunc: func(t *testing.T, got []byte) {
+				messages := gjson.GetBytes(got, "messages")
+				if !messages.IsArray() || len(messages.Array()) != 4 {
+					t.Fatal("expected 4 messages")
+				}
+				// Check both users after assistant are transformed
+				for i := 2; i < 4; i++ {
+					msg := messages.Array()[i]
+					if msg.Get("role").String() != "tool" {
+						t.Errorf("message %d should be tool", i)
+					}
+					if msg.Get("tool_call_id").String() == "" {
+						t.Errorf("message %d should have tool_call_id", i)
+					}
+				}
+			},
 		},
 		{
-			name:     "array content transform",
-			input:    `{"messages":[{"role":"user","content":[{"type":"text","text":"hello"},{"type":"text","text":"world"}]}]}`,
-			expected: `{"messages":[{"role":"user","content":[{"type":"text","text":"hello"},{"type":"text","text":"world"}]}]}`,
-		},
-		{
-			name:     "first user array preserved second transformed",
-			input:    `{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]},{"role":"user","content":[{"type":"text","text":"world"}]}]}`,
-			expected: `{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]},{"role":"developer","content":"[user request] world"}]}`,
+			name:  "array content after assistant - transform to tool",
+			input: `{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"answer"},{"role":"user","content":[{"type":"text","text":"line1"},{"type":"text","text":"line2"}]}]}`,
+			checkFunc: func(t *testing.T, got []byte) {
+				messages := gjson.GetBytes(got, "messages")
+				tool := messages.Array()[2]
+				if tool.Get("role").String() != "tool" {
+					t.Error("should be tool")
+				}
+				content := tool.Get("content").String()
+				if !strings.Contains(content, "line1") || !strings.Contains(content, "line2") {
+					t.Error("content should contain both lines")
+				}
+			},
 		},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := transformAllUserToDeveloper([]byte(tt.input))
-			if string(got) != tt.expected {
-				t.Errorf("transformAllUserToDeveloper() = %s, want %s", string(got), tt.expected)
-			}
+			got := transformUserToToolResponse([]byte(tt.input))
+			tt.checkFunc(t, got)
 		})
 	}
 }

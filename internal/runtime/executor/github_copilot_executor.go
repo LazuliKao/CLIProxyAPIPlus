@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,7 +23,6 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
-
 const (
 	githubCopilotBaseURL       = "https://api.githubcopilot.com"
 	githubCopilotChatPath      = "/chat/completions"
@@ -129,7 +129,7 @@ func (e *GitHubCopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.
 		body = mergeToolResultBlocks(body)
 	}
 	if e.cfg.Copilot.TransformUserToDeveloper {
-		body = transformAllUserToDeveloper(body)
+		body = transformUserToToolResponse(body)
 	}
 
 	// Detect vision content before input normalization removes messages
@@ -265,7 +265,7 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		body = mergeToolResultBlocks(body)
 	}
 	if e.cfg.Copilot.TransformUserToDeveloper {
-		body = transformAllUserToDeveloper(body)
+		body = transformUserToToolResponse(body)
 	}
 
 	// Detect vision content before input normalization removes messages
@@ -1328,49 +1328,144 @@ func mergeToolResultBlocks(body []byte) []byte {
 	return result
 }
 
-// transformAllUserToDeveloper converts all user messages to developer role
-// to avoid GitHub Copilot Premium request billing.
-func transformAllUserToDeveloper(body []byte) []byte {
+// transformUserToToolResponse converts follow-up user messages to tool role
+// by injecting fake tool_use blocks into assistant messages and transforming
+// user messages to tool responses. This avoids GitHub Copilot Premium billing.
+func transformUserToToolResponse(body []byte) []byte {
 	messages := gjson.GetBytes(body, "messages")
 	if !messages.Exists() || !messages.IsArray() {
 		return body
 	}
-	result := body
-	firstUserKept := false
-	for i, msg := range messages.Array() {
+	arr := messages.Array()
+	// Check if there's any assistant message
+	hasAssistant := false
+	for _, msg := range arr {
+		if msg.Get("role").String() == "assistant" {
+			hasAssistant = true
+			break
+		}
+	}
+	if !hasAssistant {
+		return body
+	}
+
+	// Collect transforms needed: user index -> (assistant index, tool call ID)
+	type transformInfo struct {
+		userIndex    int
+		assistantIdx int
+		toolCallID   string
+	}
+	var transforms []transformInfo
+	for i, msg := range arr {
 		if msg.Get("role").String() != "user" {
 			continue
 		}
 
-		if !firstUserKept {
-			firstUserKept = true
-			continue
+		// Find the nearest assistant before this user
+		lastAssistantIdx := -1
+		for j := i - 1; j >= 0; j-- {
+			if arr[j].Get("role").String() == "assistant" {
+				lastAssistantIdx = j
+				break
+			}
 		}
 
-		// Change role to developer
-		pathRole := fmt.Sprintf("messages.%d.role", i)
-		result, _ = sjson.SetBytes(result, pathRole, "developer")
+		if lastAssistantIdx >= 0 {
+			transforms = append(transforms, transformInfo{
+				userIndex:    i,
+				assistantIdx: lastAssistantIdx,
+				toolCallID:   randomID(),
+			})
+		}
+	}
 
-		content := msg.Get("content")
+	if len(transforms) == 0 {
+		return body
+	}
+
+	result := body
+
+	// Group transforms by assistant index to inject all tool_uses at once
+	assistantToolUses := make(map[int][]transformInfo)
+	for _, t := range transforms {
+		assistantToolUses[t.assistantIdx] = append(assistantToolUses[t.assistantIdx], t)
+	}
+
+	// Inject tool_use blocks into assistant messages
+	for assistantIdx, toolUses := range assistantToolUses {
+		assistantMsg := arr[assistantIdx]
+		content := assistantMsg.Get("content")
+
+		var newContent []map[string]interface{}
+
+		// Handle existing content
+		if content.Type == gjson.String {
+			// Convert string content to text block
+			if content.String() != "" {
+				newContent = append(newContent, map[string]interface{}{
+					"type": "text",
+					"text": content.String(),
+				})
+			}
+		} else if content.IsArray() {
+			for _, block := range content.Array() {
+				newContent = append(newContent, block.Value().(map[string]interface{}))
+			}
+		}
+
+		// Add fake tool_use blocks
+		for _, t := range toolUses {
+			newContent = append(newContent, map[string]interface{}{
+				"type":  "tool_use",
+				"id":    t.toolCallID,
+				"name":  "ask_user",
+				"input": map[string]interface{}{},
+			})
+		}
+
+		// Set the new content
+		pathContent := fmt.Sprintf("messages.%d.content", assistantIdx)
+		result, _ = sjson.SetBytes(result, pathContent, newContent)
+	}
+
+	// Transform user messages to tool responses
+	for _, t := range transforms {
+		userMsg := arr[t.userIndex]
+		content := userMsg.Get("content")
 		var newContent string
 		if content.Type == gjson.String {
-			newContent = "[user request] " + content.String()
+			newContent = "User's response: " + content.String()
 		} else if content.IsArray() {
 			var textParts []string
 			for _, part := range content.Array() {
 				if part.Get("type").String() == "text" {
-					if t := part.Get("text").String(); t != "" {
-						textParts = append(textParts, t)
+					if text := part.Get("text").String(); text != "" {
+						textParts = append(textParts, text)
 					}
 				}
 			}
-			newContent = "[user request] " + strings.Join(textParts, "\n")
+			newContent = "User's response: " + strings.Join(textParts, "\n")
 		} else {
-			newContent = "[user request] " + content.String()
+			newContent = "User's response: " + content.String()
 		}
 
-		pathContent := fmt.Sprintf("messages.%d.content", i)
+		pathRole := fmt.Sprintf("messages.%d.role", t.userIndex)
+		result, _ = sjson.SetBytes(result, pathRole, "tool")
+		pathToolCallID := fmt.Sprintf("messages.%d.tool_call_id", t.userIndex)
+		result, _ = sjson.SetBytes(result, pathToolCallID, t.toolCallID)
+
+		pathContent := fmt.Sprintf("messages.%d.content", t.userIndex)
 		result, _ = sjson.SetBytes(result, pathContent, newContent)
 	}
 	return result
+}
+
+// randomID generates a random hex string for tool call IDs
+func randomID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback to timestamp if rand fails
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%x", b)
 }
