@@ -23,6 +23,7 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
 const (
 	githubCopilotBaseURL       = "https://api.githubcopilot.com"
 	githubCopilotChatPath      = "/chat/completions"
@@ -153,6 +154,7 @@ func (e *GitHubCopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, req.Model, to.String(), "", body, originalTranslated, requestedModel)
 	body, _ = sjson.SetBytes(body, "stream", false)
+	log.Infof("github-copilot executor outgoing body (non-stream): %s", string(body))
 
 	path := githubCopilotChatPath
 	if useResponses {
@@ -293,6 +295,7 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	if !useResponses {
 		body, _ = sjson.SetBytes(body, "stream_options.include_usage", true)
 	}
+	log.Infof("github-copilot executor outgoing body (stream): %s", string(body))
 
 	path := githubCopilotChatPath
 	if useResponses {
