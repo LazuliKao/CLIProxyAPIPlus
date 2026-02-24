@@ -1374,7 +1374,7 @@ func transformUserToToolResponse(body []byte) []byte {
 			transforms = append(transforms, transformInfo{
 				userIndex:    i,
 				assistantIdx: lastAssistantIdx,
-				toolCallID:   randomID(),
+				toolCallID:   "call_" + randomID(),
 			})
 		}
 	}
@@ -1385,58 +1385,61 @@ func transformUserToToolResponse(body []byte) []byte {
 
 	result := body
 
-	// Group transforms by assistant index to inject all tool_uses at once
-	assistantToolUses := make(map[int][]transformInfo)
+	assistantToolCalls := make(map[int][]transformInfo)
 	for _, t := range transforms {
-		assistantToolUses[t.assistantIdx] = append(assistantToolUses[t.assistantIdx], t)
+		assistantToolCalls[t.assistantIdx] = append(assistantToolCalls[t.assistantIdx], t)
 	}
 
-	// Inject tool_use blocks into assistant messages
-	for assistantIdx, toolUses := range assistantToolUses {
+	for assistantIdx, toolUses := range assistantToolCalls {
 		assistantMsg := arr[assistantIdx]
-		content := assistantMsg.Get("content")
 
-		var newContent []map[string]interface{}
-
-		// Handle existing content
-		if content.Type == gjson.String {
-			// Convert string content to text block
-			if content.String() != "" {
-				newContent = append(newContent, map[string]interface{}{
-					"type": "text",
-					"text": content.String(),
-				})
-			}
-		} else if content.IsArray() {
-			for _, block := range content.Array() {
-				newContent = append(newContent, block.Value().(map[string]interface{}))
+		var toolCalls []map[string]interface{}
+		existingToolCalls := assistantMsg.Get("tool_calls")
+		if existingToolCalls.IsArray() {
+			for _, tc := range existingToolCalls.Array() {
+				if tcObj, ok := tc.Value().(map[string]interface{}); ok {
+					toolCalls = append(toolCalls, tcObj)
+				}
 			}
 		}
 
-		// Add fake tool_use blocks
 		for _, t := range toolUses {
-			newContent = append(newContent, map[string]interface{}{
-				"type":  "tool_use",
-				"id":    t.toolCallID,
-				"name":  "ask_user",
-				"input": map[string]interface{}{},
+			toolCalls = append(toolCalls, map[string]interface{}{
+				"id":   t.toolCallID,
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":      "ask_user",
+					"arguments": "{}",
+				},
 			})
 		}
+		pathToolCalls := fmt.Sprintf("messages.%d.tool_calls", assistantIdx)
+		result, _ = sjson.SetBytes(result, pathToolCalls, toolCalls)
 
-		// Set the new content
-		pathContent := fmt.Sprintf("messages.%d.content", assistantIdx)
-		result, _ = sjson.SetBytes(result, pathContent, newContent)
+		content := assistantMsg.Get("content")
+		if !content.Exists() {
+			pathContent := fmt.Sprintf("messages.%d.content", assistantIdx)
+			result, _ = sjson.SetBytes(result, pathContent, "")
+		} else if content.IsArray() {
+			var textParts []string
+			for _, part := range content.Array() {
+				if part.Get("type").String() == "text" {
+					if txt := part.Get("text").String(); txt != "" {
+						textParts = append(textParts, txt)
+					}
+				}
+			}
+			pathContent := fmt.Sprintf("messages.%d.content", assistantIdx)
+			result, _ = sjson.SetBytes(result, pathContent, strings.Join(textParts, ""))
+		}
 	}
 
-	// Transform user messages content to tool_result format
-	// Keep role as "user" but change content structure
 	for _, t := range transforms {
 		userMsg := arr[t.userIndex]
 		content := userMsg.Get("content")
-		// Build the text content
-		var textContent string
+		var toolContent string
 		if content.Type == gjson.String {
-			textContent = content.String()
+			toolContent = content.String()
 		} else if content.IsArray() {
 			var textParts []string
 			for _, part := range content.Array() {
@@ -1446,27 +1449,17 @@ func transformUserToToolResponse(body []byte) []byte {
 					}
 				}
 			}
-			textContent = strings.Join(textParts, "\n")
+			toolContent = strings.Join(textParts, "\n")
 		} else {
-			textContent = content.String()
+			toolContent = content.String()
 		}
 
-		// Create tool_result content array
-		toolResultContent := []map[string]interface{}{
-			{
-				"type":        "tool_result",
-				"tool_use_id": t.toolCallID,
-				"content": []map[string]interface{}{
-					{
-						"type": "text",
-						"text": textContent,
-					},
-				},
-				"is_error": false,
-			},
-		}
+		pathRole := fmt.Sprintf("messages.%d.role", t.userIndex)
+		result, _ = sjson.SetBytes(result, pathRole, "tool")
+		pathToolCallID := fmt.Sprintf("messages.%d.tool_call_id", t.userIndex)
+		result, _ = sjson.SetBytes(result, pathToolCallID, t.toolCallID)
 		pathContent := fmt.Sprintf("messages.%d.content", t.userIndex)
-		result, _ = sjson.SetBytes(result, pathContent, toolResultContent)
+		result, _ = sjson.SetBytes(result, pathContent, toolContent)
 	}
 	return result
 }
