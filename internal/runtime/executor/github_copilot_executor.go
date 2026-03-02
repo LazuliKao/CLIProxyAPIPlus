@@ -1364,6 +1364,21 @@ func transformUserToToolResponse(body []byte) []byte {
 			continue
 		}
 
+		// Skip user messages that are already tool results (real tool_result blocks)
+		userContent := msg.Get("content")
+		if userContent.IsArray() {
+			isToolResult := false
+			for _, part := range userContent.Array() {
+				if part.Get("type").String() == "tool_result" {
+					isToolResult = true
+					break
+				}
+			}
+			if isToolResult {
+				continue
+			}
+		}
+
 		// Find the nearest assistant before this user
 		lastAssistantIdx := -1
 		for j := i - 1; j >= 0; j-- {
@@ -1374,6 +1389,25 @@ func transformUserToToolResponse(body []byte) []byte {
 		}
 
 		if lastAssistantIdx >= 0 {
+			// Skip if the assistant already has real tool_use content blocks or tool_calls
+			assistantMsg := arr[lastAssistantIdx]
+			assistantContent := assistantMsg.Get("content")
+			if assistantContent.IsArray() {
+				hasToolUse := false
+				for _, part := range assistantContent.Array() {
+					if part.Get("type").String() == "tool_use" {
+						hasToolUse = true
+						break
+					}
+				}
+				if hasToolUse {
+					continue
+				}
+			}
+			if assistantMsg.Get("tool_calls").IsArray() {
+				continue
+			}
+
 			transforms = append(transforms, transformInfo{
 				userIndex:    i,
 				assistantIdx: lastAssistantIdx,
