@@ -1527,29 +1527,44 @@ func transformUserToToolResponse(body []byte) []byte {
 	for _, t := range transforms {
 		userMsg := arr[t.userIndex]
 		content := userMsg.Get("content")
-		var toolContent string
-		if content.Type == gjson.String {
-			toolContent = content.String()
-		} else if content.IsArray() {
-			var textParts []string
-			for _, part := range content.Array() {
-				if part.Get("type").String() == "text" {
-					if text := part.Get("text").String(); text != "" {
-						textParts = append(textParts, text)
-					}
-				}
-			}
-			toolContent = strings.Join(textParts, "\n")
-		} else {
-			toolContent = content.String()
-		}
 
 		pathRole := fmt.Sprintf("messages.%d.role", t.userIndex)
 		result, _ = sjson.SetBytes(result, pathRole, "tool")
 		pathToolCallID := fmt.Sprintf("messages.%d.tool_call_id", t.userIndex)
 		result, _ = sjson.SetBytes(result, pathToolCallID, t.toolCallID)
 		pathContent := fmt.Sprintf("messages.%d.content", t.userIndex)
-		result, _ = sjson.SetBytes(result, pathContent, toolContent)
+
+		if content.Type == gjson.String {
+			// Plain string content — keep as-is.
+			result, _ = sjson.SetBytes(result, pathContent, content.String())
+		} else if content.IsArray() {
+			// Check whether the array is pure-text or mixed (e.g. contains images).
+			hasNonText := false
+			for _, part := range content.Array() {
+				if typ := part.Get("type").String(); typ != "" && typ != "text" {
+					hasNonText = true
+					break
+				}
+			}
+			if hasNonText {
+				// Mixed content (e.g. text + image_url): preserve the raw array so
+				// images are not dropped. The tool role supports array content.
+				result, _ = sjson.SetRawBytes(result, pathContent, []byte(content.Raw))
+			} else {
+				// Pure-text array: flatten to a single string as before.
+				var textParts []string
+				for _, part := range content.Array() {
+					if typ := part.Get("type").String(); typ == "text" {
+						if text := part.Get("text").String(); text != "" {
+							textParts = append(textParts, text)
+						}
+					}
+				}
+				result, _ = sjson.SetBytes(result, pathContent, strings.Join(textParts, "\n"))
+			}
+		} else {
+			result, _ = sjson.SetBytes(result, pathContent, content.String())
+		}
 	}
 	return result
 }

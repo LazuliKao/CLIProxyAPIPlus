@@ -525,6 +525,35 @@ func TestTransformUserToToolResponse(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:  "user content with image IS transformed but array content is preserved",
+			input: `{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"answer"},{"role":"user","content":[{"type":"text","text":"describe this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}}]}]}`,
+			checkFunc: func(t *testing.T, got []byte) {
+				messages := gjson.GetBytes(got, "messages").Array()
+				if len(messages) != 3 {
+					t.Fatalf("messages len = %d, want 3", len(messages))
+				}
+				// Message is transformed to tool role
+				if role := messages[2].Get("role").String(); role != "tool" {
+					t.Fatalf("third message role = %q, want tool", role)
+				}
+				// Content should still be an array (raw preserved) with 2 parts
+				content := messages[2].Get("content")
+				if !content.IsArray() {
+					t.Fatalf("third message content should remain an array, got %s", content.Raw)
+				}
+				parts := content.Array()
+				if len(parts) != 2 {
+					t.Fatalf("content array len = %d, want 2", len(parts))
+				}
+				if parts[0].Get("type").String() != "text" {
+					t.Fatalf("parts[0].type = %q, want text", parts[0].Get("type").String())
+				}
+				if parts[1].Get("type").String() != "image_url" {
+					t.Fatalf("parts[1].type = %q, want image_url", parts[1].Get("type").String())
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
