@@ -113,6 +113,12 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
+	if e.cfg != nil && e.cfg.Codex.MergeToolBlocks {
+		body = codexMergeToolOutputBlocks(body)
+	}
+	if e.cfg != nil && e.cfg.Codex.TransformUserMessages {
+		body = codexTransformUserToFunctionOutput(body)
+	}
 	if !gjson.GetBytes(body, "instructions").Exists() {
 		body, _ = sjson.SetBytes(body, "instructions", "")
 	}
@@ -220,6 +226,12 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
+	if e.cfg != nil && e.cfg.Codex.MergeToolBlocks {
+		body = codexMergeToolOutputBlocks(body)
+	}
+	if e.cfg != nil && e.cfg.Codex.TransformUserMessages {
+		body = codexTransformUserToFunctionOutput(body)
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -312,6 +324,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+	if e.cfg != nil && e.cfg.Codex.MergeToolBlocks {
+		body = codexMergeToolOutputBlocks(body)
+	}
+	if e.cfg != nil && e.cfg.Codex.TransformUserMessages {
+		body = codexTransformUserToFunctionOutput(body)
+	}
 	if !gjson.GetBytes(body, "instructions").Exists() {
 		body, _ = sjson.SetBytes(body, "instructions", "")
 	}
@@ -761,3 +779,245 @@ func (e *CodexExecutor) resolveCodexConfig(auth *cliproxyauth.Auth) *config.Code
 	}
 	return nil
 }
+
+// codexMergeToolOutputBlocks merges adjacent user message text items into the
+// preceding function_call_output item in the Codex `input` array. This reduces
+// the number of turns billed by GitHub Codex (Responses API format).
+//
+// Logic:
+//   - Scan the `input` array for function_call_output items.
+//   - Collect any immediately following {"type":"message","role":"user"} items.
+//   - Append their text to the function_call_output.output field, removing the
+//     standalone user messages from the array.
+func codexMergeToolOutputBlocks(body []byte) []byte {
+	input := gjson.GetBytes(body, "input")
+	if !input.Exists() || !input.IsArray() {
+		return body
+	}
+	items := input.Array()
+	if len(items) == 0 {
+		return body
+	}
+
+	// Track which indices to drop (user messages merged into tool output).
+	type mergeOp struct {
+		toolOutputIdx int
+		textToAppend  string
+		dropIndices   []int
+	}
+	var ops []mergeOp
+
+	i := 0
+	for i < len(items) {
+		item := items[i]
+		if item.Get("type").String() != "function_call_output" {
+			i++
+			continue
+		}
+		// Collect consecutive user-message items that follow.
+		var textParts []string
+		var dropIdx []int
+		j := i + 1
+		for j < len(items) {
+			next := items[j]
+			if next.Get("type").String() != "message" || next.Get("role").String() != "user" {
+				break
+			}
+			// Extract text from the user message content.
+			content := next.Get("content")
+			if content.IsArray() {
+				for _, part := range content.Array() {
+					typ := part.Get("type").String()
+					if typ == "text" || typ == "input_text" {
+						if txt := part.Get("text").String(); txt != "" {
+							textParts = append(textParts, txt)
+						}
+					} else if part.Type == gjson.String {
+						if txt := part.String(); txt != "" {
+							textParts = append(textParts, txt)
+						}
+					}
+				}
+			} else if content.Type == gjson.String {
+				if txt := content.String(); txt != "" {
+					textParts = append(textParts, txt)
+				}
+			}
+			dropIdx = append(dropIdx, j)
+			j++
+		}
+		if len(textParts) > 0 {
+			ops = append(ops, mergeOp{
+				toolOutputIdx: i,
+				textToAppend:  "\n\nPlease execute skill now:" + strings.Join(textParts, "\n\nPlease execute skill now:"),
+				dropIndices:   dropIdx,
+			})
+		}
+		i = j
+	}
+
+	if len(ops) == 0 {
+		return body
+	}
+
+	// Build a set of indices to drop.
+	dropSet := make(map[int]struct{})
+	for _, op := range ops {
+		for _, idx := range op.dropIndices {
+			dropSet[idx] = struct{}{}
+		}
+	}
+
+	// Build the new input array.
+	newInput := "[]"
+	for idx, item := range items {
+		if _, drop := dropSet[idx]; drop {
+			continue
+		}
+		raw := item.Raw
+		// Check if this index is a merge target.
+		for _, op := range ops {
+			if op.toolOutputIdx == idx {
+				existing := item.Get("output").String()
+				updated, _ := sjson.Set(raw, "output", existing+op.textToAppend)
+				raw = updated
+				break
+			}
+		}
+		newInput, _ = sjson.SetRaw(newInput, "-1", raw)
+	}
+
+	result, _ := sjson.SetRawBytes(body, "input", []byte(newInput))
+	return result
+}
+
+// codexTransformUserToFunctionOutput converts follow-up user messages (plain
+// user turns after an assistant turn) into function_call / function_call_output
+// pairs inside the Codex `input` array. This avoids new-turn billing by making
+// every exchange look like a tool-use continuation.
+//
+// The transformation is skipped for messages that already follow a
+// function_call item (they are real tool results) and for the very first user
+// message in the conversation (no prior assistant turn).
+func codexTransformUserToFunctionOutput(body []byte) []byte {
+	input := gjson.GetBytes(body, "input")
+	if !input.Exists() || !input.IsArray() {
+		return body
+	}
+	items := input.Array()
+
+	// Check that there is at least one assistant message.
+	hasAssistant := false
+	for _, item := range items {
+		if item.Get("type").String() == "message" && item.Get("role").String() == "assistant" {
+			hasAssistant = true
+			break
+		}
+	}
+	if !hasAssistant {
+		return body
+	}
+
+	// Identify user-message items to transform.
+	type injection struct {
+		// insertBefore is the index of the user-message item in the original slice.
+		insertBefore int
+		callID       string
+	}
+	var injections []injection
+
+	for i, item := range items {
+		if item.Get("type").String() != "message" || item.Get("role").String() != "user" {
+			continue
+		}
+		// Skip if the immediately preceding non-user item is a function_call
+		// (this user message is already a real tool result placeholder).
+		prev := -1
+		for j := i - 1; j >= 0; j-- {
+			pt := items[j].Get("type").String()
+			if pt != "message" || items[j].Get("role").String() != "user" {
+				prev = j
+				break
+			}
+		}
+		if prev >= 0 {
+			prevType := items[prev].Get("type").String()
+			// Already a function_call_output before us — skip.
+			if prevType == "function_call_output" {
+				continue
+			}
+			// No assistant turn before us at all — skip.
+			prevIsAssistant := prevType == "message" && items[prev].Get("role").String() == "assistant"
+			prevIsFuncCall := prevType == "function_call"
+			if !prevIsAssistant && !prevIsFuncCall {
+				continue
+			}
+		} else {
+			// No earlier item at all (first item is user) — skip.
+			continue
+		}
+
+		injections = append(injections, injection{
+			insertBefore: i,
+			callID:       "call_" + randomID(),
+		})
+	}
+
+	if len(injections) == 0 {
+		return body
+	}
+
+	// Rebuild the input array with injected function_call + function_call_output pairs.
+	// Build a map for quick lookup.
+	injectAt := make(map[int]injection, len(injections))
+	for _, inj := range injections {
+		injectAt[inj.insertBefore] = inj
+	}
+
+	newInput := "[]"
+	for i, item := range items {
+		if inj, ok := injectAt[i]; ok {
+			// Inject a fake function_call before this user message.
+			fakeCall := `{"type":"function_call","call_id":"","name":"ask_user","arguments":"{}"}`
+			fakeCall, _ = sjson.Set(fakeCall, "call_id", inj.callID)
+			newInput, _ = sjson.SetRaw(newInput, "-1", fakeCall)
+
+			// Convert the user message into a function_call_output.
+			content := item.Get("content")
+			var outputText string
+			if content.Type == gjson.String {
+				outputText = content.String()
+			} else if content.IsArray() {
+				// For mixed content (e.g. text + image_url) we extract only the
+				// text portion; image data cannot be tunnelled through output.
+				var parts []string
+				for _, part := range content.Array() {
+					typ := part.Get("type").String()
+					if typ == "text" || typ == "input_text" {
+						if txt := part.Get("text").String(); txt != "" {
+							parts = append(parts, txt)
+						}
+					} else if part.Type == gjson.String {
+						if txt := part.String(); txt != "" {
+							parts = append(parts, txt)
+						}
+					}
+				}
+				outputText = strings.Join(parts, "\n")
+			} else {
+				outputText = content.String()
+			}
+
+			fakeOutput := `{"type":"function_call_output","call_id":"","output":""}`
+			fakeOutput, _ = sjson.Set(fakeOutput, "call_id", inj.callID)
+			fakeOutput, _ = sjson.Set(fakeOutput, "output", outputText)
+			newInput, _ = sjson.SetRaw(newInput, "-1", fakeOutput)
+			continue
+		}
+		newInput, _ = sjson.SetRaw(newInput, "-1", item.Raw)
+	}
+
+	result, _ := sjson.SetRawBytes(body, "input", []byte(newInput))
+	return result
+}
+

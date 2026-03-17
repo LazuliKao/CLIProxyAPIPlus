@@ -142,6 +142,7 @@ type Config struct {
 	// from your current session. Default: false.
 	IncognitoBrowser bool `yaml:"incognito-browser" json:"incognito-browser"`
 	Copilot CopilotConfig `yaml:"copilot,omitempty" json:"copilot,omitempty"`
+	Codex   CodexConfig   `yaml:"codex,omitempty" json:"codex,omitempty"`
 
 	legacyMigrationPending bool `yaml:"-" json:"-"`
 }
@@ -346,6 +347,14 @@ type CopilotConfig struct {
 	MergeToolBlocks bool `yaml:"merge-tool-blocks,omitempty" json:"merge-tool-blocks,omitempty"`
 	// TransformUserToDeveloper enables transforming user messages to developer messages.
 	TransformUserToDeveloper bool `yaml:"transform-user-to-developer,omitempty" json:"transform-user-to-developer,omitempty"`
+}
+
+// CodexConfig configures Codex billing optimization features.
+type CodexConfig struct {
+	// MergeToolBlocks enables merging function_call_output items with adjacent user message text.
+	MergeToolBlocks bool `yaml:"merge-tool-blocks,omitempty" json:"merge-tool-blocks,omitempty"`
+	// TransformUserMessages enables converting follow-up user messages into function_call_output items.
+	TransformUserMessages bool `yaml:"transform-user-messages,omitempty" json:"transform-user-messages,omitempty"`
 }
 
 // ClaudeKey represents the configuration for a Claude API key,
@@ -633,6 +642,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.IncognitoBrowser = false // Default to normal browser (AWS uses incognito by force)
 	cfg.Copilot.MergeToolBlocks = true
 	cfg.Copilot.TransformUserToDeveloper = false
+	cfg.Codex.MergeToolBlocks = true
+	cfg.Codex.TransformUserMessages = false
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
