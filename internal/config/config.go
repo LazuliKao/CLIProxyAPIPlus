@@ -140,9 +140,9 @@ type Config struct {
 	// IncognitoBrowser enables opening OAuth URLs in incognito/private browsing mode.
 	// This is useful when you want to login with a different account without logging out
 	// from your current session. Default: false.
-	IncognitoBrowser bool `yaml:"incognito-browser" json:"incognito-browser"`
-	Copilot CopilotConfig `yaml:"copilot,omitempty" json:"copilot,omitempty"`
-	Codex   CodexConfig   `yaml:"codex,omitempty" json:"codex,omitempty"`
+	IncognitoBrowser bool          `yaml:"incognito-browser" json:"incognito-browser"`
+	Copilot          CopilotConfig `yaml:"copilot,omitempty" json:"copilot,omitempty"`
+	Codex            CodexConfig   `yaml:"codex,omitempty" json:"codex,omitempty"`
 
 	legacyMigrationPending bool `yaml:"-" json:"-"`
 }
@@ -346,7 +346,7 @@ type CopilotConfig struct {
 	// MergeToolBlocks enables merging tool_result and text blocks.
 	MergeToolBlocks bool `yaml:"merge-tool-blocks,omitempty" json:"merge-tool-blocks,omitempty"`
 	// TransformUserToDeveloper enables transforming user messages to developer messages.
-	TransformUserToDeveloper bool `yaml:"transform-user-to-developer,omitempty" json:"transform-user-to-developer,omitempty"`
+	TransformUserToDeveloper bool `yaml:"transform-user-messages,omitempty" json:"transform-user-messages,omitempty"`
 }
 
 // CodexConfig configures Codex billing optimization features.
