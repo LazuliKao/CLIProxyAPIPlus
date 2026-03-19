@@ -14,6 +14,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -35,6 +36,7 @@ type upstreamRequestLog struct {
 	AuthLabel string
 	AuthType  string
 	AuthValue string
+	Tier      string
 }
 
 type upstreamAttempt struct {
@@ -80,7 +82,7 @@ func recordAPIRequest(ctx context.Context, cfg *config.Config, info upstreamRequ
 	writeHeaders(builder, info.Headers)
 	builder.WriteString("\nBody:\n")
 	if len(info.Body) > 0 {
-		builder.WriteString(string(info.Body))
+		builder.WriteString(string(bytes.Clone(info.Body)))
 	} else {
 		builder.WriteString("<empty>")
 	}
@@ -152,7 +154,7 @@ func appendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byt
 	if cfg == nil || !cfg.RequestLog {
 		return
 	}
-	data := bytes.TrimSpace(chunk)
+	data := bytes.TrimSpace(bytes.Clone(chunk))
 	if len(data) == 0 {
 		return
 	}
@@ -296,6 +298,9 @@ func formatAuthInfo(info upstreamRequestLog) string {
 	if trimmed := strings.TrimSpace(info.AuthLabel); trimmed != "" {
 		parts = append(parts, fmt.Sprintf("label=%s", trimmed))
 	}
+	if trimmed := strings.TrimSpace(info.Tier); trimmed != "" {
+		parts = append(parts, fmt.Sprintf("tier=%s", trimmed))
+	}
 
 	authType := strings.ToLower(strings.TrimSpace(info.AuthType))
 	authValue := strings.TrimSpace(info.AuthValue)
@@ -388,4 +393,40 @@ func logWithRequestID(ctx context.Context) *log.Entry {
 		return log.NewEntry(log.StandardLogger())
 	}
 	return log.WithField("request_id", requestID)
+}
+
+// logDetailedAPIError logs detailed error information for API errors at Warn/Error level.
+// This function logs the full error body, URL, status code, and provider information.
+// 4xx errors are logged at Warn level, 5xx errors at Error level.
+func logDetailedAPIError(ctx context.Context, provider string, url string, statusCode int, contentType string, body []byte) {
+	entry := logWithRequestID(ctx)
+
+	// 4xx는 Warn, 5xx는 Error
+	logFn := entry.Warnf
+	if statusCode >= 500 {
+		logFn = entry.Errorf
+	}
+
+	// 전체 에러 바디 로깅 (단, 너무 길면 잘라냄)
+	bodyStr := string(body)
+	if len(bodyStr) > 4096 {
+		bodyStr = bodyStr[:4096] + "...[truncated]"
+	}
+
+	// Extract auth info from context for logging
+	providerDisplay := provider
+	if ctxProvider, _, authLabel := cliproxyauth.GetProviderAuthFromContext(ctx); ctxProvider != "" {
+		displayAuth := authLabel
+		if displayAuth == "" {
+			if _, authID, _ := cliproxyauth.GetProviderAuthFromContext(ctx); authID != "" {
+				displayAuth = authID
+			}
+		}
+		if displayAuth != "" {
+			providerDisplay = fmt.Sprintf("%s:%s", provider, displayAuth)
+		}
+	}
+
+	logFn("[%s] API error - URL: %s, Status: %d, Content-Type: %s, Response: %s",
+		providerDisplay, url, statusCode, contentType, bodyStr)
 }

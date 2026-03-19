@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
@@ -23,6 +24,62 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 )
+
+const providerAuthContextKey = "cliproxy.provider_auth"
+const GinProviderAuthKey = "providerAuth"
+const fallbackInfoContextKey = "cliproxy.fallback_info"
+const GinFallbackInfoKey = "fallbackInfo"
+
+func SetProviderAuthInContext(ctx context.Context, provider, authID, authLabel string) context.Context {
+	authInfo := map[string]string{
+		"provider":   provider,
+		"auth_id":    authID,
+		"auth_label": authLabel,
+	}
+
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
+		ginCtx.Set(GinProviderAuthKey, authInfo)
+	}
+
+	return context.WithValue(ctx, providerAuthContextKey, authInfo)
+}
+
+func GetProviderAuthFromContext(ctx context.Context) (provider, authID, authLabel string) {
+	if ctx == nil {
+		return "", "", ""
+	}
+	if v, ok := ctx.Value(providerAuthContextKey).(map[string]string); ok {
+		return v["provider"], v["auth_id"], v["auth_label"]
+	}
+	return "", "", ""
+}
+
+func SetFallbackInfoInContext(ctx context.Context, requestedModel, actualModel string) context.Context {
+	if requestedModel == "" || actualModel == "" || requestedModel == actualModel {
+		return ctx
+	}
+
+	fallbackInfo := map[string]string{
+		"requested_model": requestedModel,
+		"actual_model":    actualModel,
+	}
+
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
+		ginCtx.Set(GinFallbackInfoKey, fallbackInfo)
+	}
+
+	return context.WithValue(ctx, fallbackInfoContextKey, fallbackInfo)
+}
+
+func GetFallbackInfoFromContext(ctx context.Context) (requestedModel, actualModel string) {
+	if ctx == nil {
+		return "", ""
+	}
+	if v, ok := ctx.Value(fallbackInfoContextKey).(map[string]string); ok {
+		return v["requested_model"], v["actual_model"]
+	}
+	return "", ""
+}
 
 // ProviderExecutor defines the contract required by Manager to execute provider calls.
 type ProviderExecutor interface {
@@ -159,6 +216,15 @@ type Manager struct {
 
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
+
+	// fallbackModels stores model fallback mappings (original -> fallback).
+	fallbackModels atomic.Value
+
+	// fallbackChain stores the general fallback chain for models not in fallbackModels.
+	fallbackChain atomic.Value
+
+	// fallbackMaxDepth limits the number of fallback attempts.
+	fallbackMaxDepth atomic.Int32
 
 	// Auto refresh state
 	refreshCancel    context.CancelFunc
@@ -541,9 +607,13 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	for idx, execModel := range execModels {
 		execReq := req
 		execReq.Model = execModel
-		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, opts)
+		execCtx := ctx
+		if execReq.Model != routeModel {
+			execCtx = SetFallbackInfoInContext(execCtx, routeModel, execReq.Model)
+		}
+		streamResult, errStream := executor.ExecuteStream(execCtx, auth, execReq, opts)
 		if errStream != nil {
-			if errCtx := ctx.Err(); errCtx != nil {
+			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
 			rerr := &Error{Message: errStream.Error()}
@@ -552,7 +622,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
-			m.MarkResult(ctx, result)
+			m.MarkResult(execCtx, result)
 			if isRequestInvalidError(errStream) {
 				return nil, errStream
 			}
@@ -560,9 +630,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			continue
 		}
 
-		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
+		buffered, closed, bootstrapErr := readStreamBootstrap(execCtx, streamResult.Chunks)
 		if bootstrapErr != nil {
-			if errCtx := ctx.Err(); errCtx != nil {
+			if errCtx := execCtx.Err(); errCtx != nil {
 				discardStreamChunks(streamResult.Chunks)
 				return nil, errCtx
 			}
@@ -573,7 +643,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				m.MarkResult(ctx, result)
+				m.MarkResult(execCtx, result)
 				discardStreamChunks(streamResult.Chunks)
 				return nil, bootstrapErr
 			}
@@ -584,7 +654,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				m.MarkResult(ctx, result)
+				m.MarkResult(execCtx, result)
 				discardStreamChunks(streamResult.Chunks)
 				lastErr = bootstrapErr
 				continue
@@ -592,13 +662,13 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			errCh := make(chan cliproxyexecutor.StreamChunk, 1)
 			errCh <- cliproxyexecutor.StreamChunk{Err: bootstrapErr}
 			close(errCh)
-			return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, streamResult.Headers, nil, errCh), nil
+			return m.wrapStreamResult(execCtx, auth.Clone(), provider, routeModel, streamResult.Headers, nil, errCh), nil
 		}
 
 		if closed && len(buffered) == 0 {
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: emptyErr}
-			m.MarkResult(ctx, result)
+			m.MarkResult(execCtx, result)
 			if idx < len(execModels)-1 {
 				lastErr = emptyErr
 				continue
@@ -606,7 +676,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			errCh := make(chan cliproxyexecutor.StreamChunk, 1)
 			errCh <- cliproxyexecutor.StreamChunk{Err: emptyErr}
 			close(errCh)
-			return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, streamResult.Headers, nil, errCh), nil
+			return m.wrapStreamResult(execCtx, auth.Clone(), provider, routeModel, streamResult.Headers, nil, errCh), nil
 		}
 
 		remaining := streamResult.Chunks
@@ -615,7 +685,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, streamResult.Headers, buffered, remaining), nil
+		return m.wrapStreamResult(execCtx, auth.Clone(), provider, routeModel, streamResult.Headers, buffered, remaining), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -762,6 +832,64 @@ func (m *Manager) SetRetryConfig(retry int, maxRetryInterval time.Duration, maxR
 	m.requestRetry.Store(int32(retry))
 	m.maxRetryCredentials.Store(int32(maxRetryCredentials))
 	m.maxRetryInterval.Store(maxRetryInterval.Nanoseconds())
+}
+
+func (m *Manager) SetFallbackModels(models map[string]string) {
+	if m == nil {
+		return
+	}
+	if models == nil {
+		models = make(map[string]string)
+	}
+	m.fallbackModels.Store(models)
+}
+
+func (m *Manager) getFallbackModel(originalModel string) (string, bool) {
+	if m == nil {
+		return "", false
+	}
+	models, ok := m.fallbackModels.Load().(map[string]string)
+	if !ok || models == nil {
+		return "", false
+	}
+	fallback, exists := models[originalModel]
+	return fallback, exists && fallback != ""
+}
+
+func (m *Manager) SetFallbackChain(chain []string, maxDepth int) {
+	if m == nil {
+		return
+	}
+	if chain == nil {
+		chain = []string{}
+	}
+	m.fallbackChain.Store(chain)
+	if maxDepth <= 0 {
+		maxDepth = 3
+	}
+	m.fallbackMaxDepth.Store(int32(maxDepth))
+}
+
+func (m *Manager) getFallbackChain() []string {
+	if m == nil {
+		return nil
+	}
+	chain, ok := m.fallbackChain.Load().([]string)
+	if !ok {
+		return nil
+	}
+	return chain
+}
+
+func (m *Manager) getFallbackMaxDepth() int {
+	if m == nil {
+		return 3
+	}
+	depth := m.fallbackMaxDepth.Load()
+	if depth <= 0 {
+		return 3
+	}
+	return int(depth)
 }
 
 // RegisterExecutor registers a provider executor with the manager.
@@ -999,22 +1127,27 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
+		// Set provider auth info in context for gin logger
+		SetProviderAuthInContext(ctx, provider, auth.ID, auth.Label)
 		tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-
 		models := m.prepareExecutionModels(auth, routeModel)
 		var authErr error
 		for _, upstreamModel := range models {
 			execReq := req
 			execReq.Model = upstreamModel
-			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
+			attemptCtx := execCtx
+			if execReq.Model != routeModel {
+				attemptCtx = SetFallbackInfoInContext(attemptCtx, routeModel, execReq.Model)
+			}
+			resp, errExec := executor.Execute(attemptCtx, auth, execReq, opts)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
 			if errExec != nil {
-				if errCtx := execCtx.Err(); errCtx != nil {
+				if errCtx := attemptCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				result.Error = &Error{Message: errExec.Error()}
@@ -1024,14 +1157,14 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
-				m.MarkResult(execCtx, result)
+				m.MarkResult(attemptCtx, result)
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
 				continue
 			}
-			m.MarkResult(execCtx, result)
+			m.MarkResult(attemptCtx, result)
 			return resp, nil
 		}
 		if authErr != nil {
@@ -1041,6 +1174,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			lastErr = authErr
 			continue
 		}
+
 	}
 }
 
@@ -1072,21 +1206,26 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
 		tried[auth.ID] = struct{}{}
+		// Set provider auth info in context for gin logger
+		SetProviderAuthInContext(ctx, provider, auth.ID, auth.Label)
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-
 		models := m.prepareExecutionModels(auth, routeModel)
 		var authErr error
 		for _, upstreamModel := range models {
 			execReq := req
 			execReq.Model = upstreamModel
-			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
+			attemptCtx := execCtx
+			if execReq.Model != routeModel {
+				attemptCtx = SetFallbackInfoInContext(attemptCtx, routeModel, execReq.Model)
+			}
+			resp, errExec := executor.CountTokens(attemptCtx, auth, execReq, opts)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
 			if errExec != nil {
-				if errCtx := execCtx.Err(); errCtx != nil {
+				if errCtx := attemptCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				result.Error = &Error{Message: errExec.Error()}
@@ -1096,14 +1235,14 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
-				m.hook.OnResult(execCtx, result)
+				m.hook.OnResult(attemptCtx, result)
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
 				continue
 			}
-			m.hook.OnResult(execCtx, result)
+			m.hook.OnResult(attemptCtx, result)
 			return resp, nil
 		}
 		if authErr != nil {
@@ -1113,6 +1252,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			lastErr = authErr
 			continue
 		}
+
 	}
 }
 
@@ -1144,6 +1284,8 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
 		tried[auth.ID] = struct{}{}
+		// Set provider auth info in context for gin logger
+		SetProviderAuthInContext(ctx, provider, auth.ID, auth.Label)
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -1480,6 +1622,31 @@ func (m *Manager) normalizeProviders(providers []string) []string {
 		result = append(result, p)
 	}
 	return result
+}
+
+func (m *Manager) rotateProviders(model string, providers []string) []string {
+	if len(providers) == 0 {
+		return nil
+	}
+
+	m.mu.Lock()
+	offset := m.providerOffsets[model]
+	m.providerOffsets[model] = (offset + 1) % len(providers)
+	m.mu.Unlock()
+
+	if len(providers) > 0 {
+		offset %= len(providers)
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if offset == 0 {
+		return providers
+	}
+	rotated := make([]string, 0, len(providers))
+	rotated = append(rotated, providers[offset:]...)
+	rotated = append(rotated, providers[:offset]...)
+	return rotated
 }
 
 func (m *Manager) retrySettings() (int, int, time.Duration) {
@@ -1873,7 +2040,8 @@ func retryAfterFromError(err error) *time.Duration {
 	if retryAfter == nil {
 		return nil
 	}
-	return new(*retryAfter)
+	cloned := *retryAfter
+	return &cloned
 }
 
 func statusCodeFromResult(err *Error) int {

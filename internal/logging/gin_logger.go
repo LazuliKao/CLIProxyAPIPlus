@@ -4,8 +4,11 @@
 package logging
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"runtime/debug"
 	"strings"
@@ -14,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 // aiAPIPrefixes defines path prefixes for AI API requests that should have request ID tracking.
@@ -27,12 +31,67 @@ var aiAPIPrefixes = []string{
 }
 
 const skipGinLogKey = "__gin_skip_request_logging__"
+const requestBodyKey = "__gin_request_body__"
+const providerAuthContextKey = "cliproxy.provider_auth"
+const ginProviderAuthKey = "providerAuth"
+const fallbackInfoContextKey = "cliproxy.fallback_info"
+const ginFallbackInfoKey = "fallbackInfo"
+
+func getProviderAuthFromContext(c *gin.Context) (provider, authID, authLabel string) {
+	if c == nil {
+		return "", "", ""
+	}
+
+	// First try to get from Gin context (set by conductor.go)
+	if v, exists := c.Get(ginProviderAuthKey); exists {
+		if authInfo, ok := v.(map[string]string); ok {
+			return authInfo["provider"], authInfo["auth_id"], authInfo["auth_label"]
+		}
+	}
+
+	// Fallback to request context
+	if c.Request == nil {
+		return "", "", ""
+	}
+	ctx := c.Request.Context()
+	if ctx == nil {
+		return "", "", ""
+	}
+	if v, ok := ctx.Value(providerAuthContextKey).(map[string]string); ok {
+		return v["provider"], v["auth_id"], v["auth_label"]
+	}
+	return "", "", ""
+}
+
+func getFallbackInfoFromContext(c *gin.Context) (requestedModel, actualModel string) {
+	if c == nil {
+		return "", ""
+	}
+
+	if v, exists := c.Get(ginFallbackInfoKey); exists {
+		if info, ok := v.(map[string]string); ok {
+			return info["requested_model"], info["actual_model"]
+		}
+	}
+
+	if c.Request == nil {
+		return "", ""
+	}
+	ctx := c.Request.Context()
+	if ctx == nil {
+		return "", ""
+	}
+	if v, ok := ctx.Value(fallbackInfoContextKey).(map[string]string); ok {
+		return v["requested_model"], v["actual_model"]
+	}
+	return "", ""
+}
 
 // GinLogrusLogger returns a Gin middleware handler that logs HTTP requests and responses
 // using logrus. It captures request details including method, path, status code, latency,
-// client IP, and any error messages. Request ID is only added for AI API requests.
+// client IP, model name, and auth key name. Request ID is only added for AI API requests.
 //
-// Output format (AI API): [2025-12-23 20:14:10] [info ] | a1b2c3d4 | 200 |       23.559s | ...
+// Output format (AI API): [2025-12-23 20:14:10] [info ] | a1b2c3d4 | 200 |       23.559s | ... | model (auth)
 // Output format (others): [2025-12-23 20:14:10] [info ] | -------- | 200 |       23.559s | ...
 //
 // Returns:
@@ -43,12 +102,20 @@ func GinLogrusLogger() gin.HandlerFunc {
 		path := c.Request.URL.Path
 		raw := util.MaskSensitiveQuery(c.Request.URL.RawQuery)
 
+		var requestBody []byte
+		if isAIAPIPath(path) && c.Request.Body != nil {
+			requestBody, _ = io.ReadAll(c.Request.Body)
+			c.Request.Body = io.NopCloser(bytes.NewReader(requestBody))
+			c.Set(requestBodyKey, requestBody)
+		}
+
 		// Only generate request ID for AI API paths
 		var requestID string
 		if isAIAPIPath(path) {
 			requestID = GenerateRequestID()
 			SetGinRequestID(c, requestID)
 			ctx := WithRequestID(c.Request.Context(), requestID)
+			ctx = context.WithValue(ctx, "gin", c)
 			c.Request = c.Request.WithContext(ctx)
 		}
 
@@ -74,16 +141,71 @@ func GinLogrusLogger() gin.HandlerFunc {
 		method := c.Request.Method
 		errorMessage := c.Errors.ByType(gin.ErrorTypePrivate).String()
 
+		modelName := ""
+		if len(requestBody) == 0 {
+			if storedBody, exists := c.Get(requestBodyKey); exists {
+				if bodyBytes, ok := storedBody.([]byte); ok {
+					requestBody = bodyBytes
+				}
+			}
+		}
+		if len(requestBody) > 0 {
+			modelName = gjson.GetBytes(requestBody, "model").String()
+			modelName = strings.TrimSpace(modelName)
+		}
+
+		authKeyName := ""
+		if apiKey, exists := c.Get("apiKey"); exists {
+			if keyStr, ok := apiKey.(string); ok {
+				authKeyName = keyStr
+			}
+		}
+
+		provider, authID, authLabel := getProviderAuthFromContext(c)
+		requestedModel, actualModel := getFallbackInfoFromContext(c)
+		providerInfo := ""
+		if provider != "" {
+			displayAuth := authLabel
+			if displayAuth == "" {
+				displayAuth = authID
+			}
+			if displayAuth != "" {
+				providerInfo = fmt.Sprintf("%s:%s", provider, displayAuth)
+			} else {
+				providerInfo = provider
+			}
+		}
+
 		if requestID == "" {
 			requestID = "--------"
 		}
+
 		logLine := fmt.Sprintf("%3d | %13v | %15s | %-7s \"%s\"", statusCode, latency, clientIP, method, path)
+
+		if isAIAPIPath(path) && (modelName != "" || providerInfo != "" || authKeyName != "") {
+			displayModelName := modelName
+			if requestedModel != "" && actualModel != "" && requestedModel != actualModel {
+				displayModelName = fmt.Sprintf("%s → %s", requestedModel, actualModel)
+			}
+
+			if displayModelName != "" && providerInfo != "" {
+				logLine = logLine + " | " + fmt.Sprintf("%s | %s", displayModelName, providerInfo)
+			} else if displayModelName != "" && authKeyName != "" {
+				logLine = logLine + " | " + fmt.Sprintf("%s | %s", displayModelName, authKeyName)
+			} else if displayModelName != "" {
+				logLine = logLine + " | " + displayModelName
+			} else if providerInfo != "" {
+				logLine = logLine + " | " + providerInfo
+			} else if authKeyName != "" {
+				logLine = logLine + " | " + authKeyName
+			}
+		}
+
 		if errorMessage != "" {
 			logLine = logLine + " | " + errorMessage
 		}
 
 		entry := log.WithField("request_id", requestID)
-
 		switch {
 		case statusCode >= http.StatusInternalServerError:
 			entry.Error(logLine)
@@ -147,4 +269,24 @@ func shouldSkipGinRequestLogging(c *gin.Context) bool {
 	}
 	flag, ok := val.(bool)
 	return ok && flag
+}
+
+// GetRequestBody retrieves the request body from context or reads it from the request.
+// This allows handlers to read the body multiple times.
+func GetRequestBody(c *gin.Context) []byte {
+	if c == nil {
+		return nil
+	}
+	if body, exists := c.Get(requestBodyKey); exists {
+		if bodyBytes, ok := body.([]byte); ok {
+			return bodyBytes
+		}
+	}
+	if c.Request.Body != nil {
+		body, _ := io.ReadAll(c.Request.Body)
+		c.Request.Body = io.NopCloser(bytes.NewReader(body))
+		c.Set(requestBodyKey, body)
+		return body
+	}
+	return nil
 }

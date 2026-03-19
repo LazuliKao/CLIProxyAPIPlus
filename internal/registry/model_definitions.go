@@ -197,6 +197,7 @@ func cloneModelInfos(models []*ModelInfo) []*ModelInfo {
 //   - kilo
 //   - github-copilot
 //   - amazonq
+//   - kilocode (alias for kilo)
 //   - antigravity (returns static overrides only)
 func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 	key := strings.ToLower(strings.TrimSpace(channel))
@@ -223,7 +224,7 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetGitHubCopilotModels()
 	case "kiro":
 		return GetKiroModels()
-	case "kilo":
+	case "kilo", "kilocode":
 		return GetKiloModels()
 	case "amazonq":
 		return GetAmazonQModels()
@@ -447,6 +448,19 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			ContextLength:       200000,
 			MaxCompletionTokens: 32768,
 			SupportedEndpoints:  []string{"/responses"},
+			Thinking:            &ThinkingSupport{Levels: []string{"none", "low", "medium", "high", "xhigh"}},
+		},
+		{
+			ID:                  "gpt-5.4",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "GPT-5.4",
+			Description:         "OpenAI GPT-5.4 via GitHub Copilot",
+			ContextLength:       200000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/chat/completions", "/responses"},
 			Thinking:            &ThinkingSupport{Levels: []string{"none", "low", "medium", "high", "xhigh"}},
 		},
 		{

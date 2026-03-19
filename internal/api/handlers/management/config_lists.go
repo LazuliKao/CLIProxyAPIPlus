@@ -733,7 +733,11 @@ func (h *Handler) PutOAuthModelAlias(c *gin.Context) {
 		entries = wrapper.Items
 	}
 	h.cfg.OAuthModelAlias = sanitizedOAuthModelAlias(entries)
-	h.persist(c)
+	if h.persist(c) {
+		if h.authManager != nil {
+			h.authManager.SetOAuthModelAlias(h.cfg.OAuthModelAlias)
+		}
+	}
 }
 
 func (h *Handler) PatchOAuthModelAlias(c *gin.Context) {
@@ -777,14 +781,22 @@ func (h *Handler) PatchOAuthModelAlias(c *gin.Context) {
 			h.cfg.OAuthModelAlias = make(map[string][]config.OAuthModelAlias)
 		}
 		h.cfg.OAuthModelAlias[channel] = []config.OAuthModelAlias{}
-		h.persist(c)
+		if h.persist(c) {
+			if h.authManager != nil {
+				h.authManager.SetOAuthModelAlias(h.cfg.OAuthModelAlias)
+			}
+		}
 		return
 	}
 	if h.cfg.OAuthModelAlias == nil {
 		h.cfg.OAuthModelAlias = make(map[string][]config.OAuthModelAlias)
 	}
 	h.cfg.OAuthModelAlias[channel] = normalized
-	h.persist(c)
+	if h.persist(c) {
+		if h.authManager != nil {
+			h.authManager.SetOAuthModelAlias(h.cfg.OAuthModelAlias)
+		}
+	}
 }
 
 func (h *Handler) DeleteOAuthModelAlias(c *gin.Context) {

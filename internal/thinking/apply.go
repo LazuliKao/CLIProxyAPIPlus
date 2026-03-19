@@ -411,11 +411,17 @@ func extractClaudeConfig(body []byte) ThinkingConfig {
 //
 // Priority: thinkingLevel is checked first (Gemini 3 format), then thinkingBudget (Gemini 2.5 format).
 // This allows newer Gemini 3 level-based configs to take precedence.
+//
+// Note: If both thinkingLevel and thinkingBudget are present, only thinkingLevel is used.
+// This prevents the 400 error: "thinking_budget and thinking_level are not supported together"
 func extractGeminiConfig(body []byte, provider string) ThinkingConfig {
 	prefix := "generationConfig.thinkingConfig"
 	if provider == "gemini-cli" || provider == "antigravity" {
 		prefix = "request.generationConfig.thinkingConfig"
 	}
+
+	//levelExists := gjson.GetBytes(body, prefix+".thinkingLevel").Exists()
+	//budgetExists := gjson.GetBytes(body, prefix+".thinkingBudget").Exists()
 
 	// Check thinkingLevel first (Gemini 3 format takes precedence)
 	level := gjson.GetBytes(body, prefix+".thinkingLevel")

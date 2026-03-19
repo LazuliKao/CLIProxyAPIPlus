@@ -4,7 +4,9 @@ import (
 	"strings"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	log "github.com/sirupsen/logrus"
 )
 
 type modelAliasEntry interface {
@@ -73,10 +75,14 @@ func (m *Manager) SetOAuthModelAlias(aliases map[string][]internalconfig.OAuthMo
 // applyOAuthModelAlias resolves the upstream model from OAuth model alias.
 // If an alias exists, the returned model is the upstream model.
 func (m *Manager) applyOAuthModelAlias(auth *Auth, requestedModel string) string {
+	channel := modelAliasChannel(auth)
+	log.Debugf("[DEBUG] applyOAuthModelAlias: provider=%s model=%s channel=%s auth_kind=%v", auth.Provider, requestedModel, channel, auth.Attributes)
 	upstreamModel := m.resolveOAuthUpstreamModel(auth, requestedModel)
 	if upstreamModel == "" {
+		log.Debugf("[DEBUG] applyOAuthModelAlias: no alias found, returning original model=%s", requestedModel)
 		return requestedModel
 	}
+	log.Debugf("[DEBUG] applyOAuthModelAlias: resolved %s -> %s", requestedModel, upstreamModel)
 	return upstreamModel
 }
 
@@ -127,6 +133,19 @@ func resolveModelAliasPoolFromConfigModels(requestedModel string, models []model
 
 	out := make([]string, 0)
 	seen := make(map[string]struct{})
+
+	// PRECEDENCE: Check direct name matches FIRST (lines 163-171 moved before alias)
+	for i := range models {
+		name := strings.TrimSpace(models[i].GetName())
+		for _, candidate := range candidates {
+			if candidate == "" || name == "" || !strings.EqualFold(name, candidate) {
+				continue
+			}
+			return []string{preserveResolvedModelSuffix(name, requestResult)}
+		}
+	}
+
+	// FALLBACK: Check alias matches SECOND (lines 135-157 moved after)
 	for i := range models {
 		name := strings.TrimSpace(models[i].GetName())
 		alias := strings.TrimSpace(models[i].GetAlias())
@@ -155,15 +174,6 @@ func resolveModelAliasPoolFromConfigModels(requestedModel string, models []model
 		return out
 	}
 
-	for i := range models {
-		name := strings.TrimSpace(models[i].GetName())
-		for _, candidate := range candidates {
-			if candidate == "" || name == "" || !strings.EqualFold(name, candidate) {
-				continue
-			}
-			return []string{preserveResolvedModelSuffix(name, requestResult)}
-		}
-	}
 	return nil
 }
 
@@ -191,6 +201,7 @@ func resolveUpstreamModelFromAliasTable(m *Manager, auth *Auth, requestedModel, 
 		return ""
 	}
 	if channel == "" {
+		log.Debugf("[DEBUG] resolveUpstreamModelFromAliasTable: empty channel for provider=%s", auth.Provider)
 		return ""
 	}
 
@@ -207,13 +218,45 @@ func resolveUpstreamModelFromAliasTable(m *Manager, auth *Auth, requestedModel, 
 	raw := m.oauthModelAlias.Load()
 	table, _ := raw.(*oauthModelAliasTable)
 	if table == nil || table.reverse == nil {
+		log.Debugf("[DEBUG] resolveUpstreamModelFromAliasTable: no alias table loaded")
 		return ""
 	}
 	rev := table.reverse[channel]
 	if rev == nil {
+		var availableChannels []string
+		for k := range table.reverse {
+			availableChannels = append(availableChannels, k)
+		}
+		log.Debugf("[DEBUG] resolveUpstreamModelFromAliasTable: no entries for channel=%s, available=%v", channel, availableChannels)
 		return ""
 	}
+	log.Debugf("[DEBUG] resolveUpstreamModelFromAliasTable: channel=%s has %d aliases, looking for candidates=%v", channel, len(rev), candidates)
 
+	if resolved := resolveRequestedModelForAuth(auth, candidates, requestResult); strings.TrimSpace(resolved) != "" {
+		return resolved
+	}
+
+	// ✅ PHASE 1 (NEW): Check if any candidate IS an upstream model (original-first)
+	for _, candidate := range candidates {
+		key := strings.ToLower(strings.TrimSpace(candidate))
+		if key == "" {
+			continue
+		}
+		// Check if this key matches any upstream model name (value) in the reverse table
+		for _, upstream := range rev {
+			upstreamKey := strings.ToLower(strings.TrimSpace(upstream))
+			if upstreamKey == "" {
+				continue
+			}
+			if strings.EqualFold(upstreamKey, key) {
+				// Found: requested model matches an upstream model name
+				log.Debugf("[DEBUG] resolveUpstreamModelFromAliasTable: candidate %s matches upstream model, returning as-is", candidate)
+				return preserveResolvedModelSuffix(candidate, requestResult)
+			}
+		}
+	}
+
+	// PHASE 2: Check if any candidate is an ALIAS
 	for _, candidate := range candidates {
 		key := strings.ToLower(strings.TrimSpace(candidate))
 		if key == "" {
@@ -241,6 +284,49 @@ func resolveUpstreamModelFromAliasTable(m *Manager, auth *Auth, requestedModel, 
 	return ""
 }
 
+func resolveRequestedModelForAuth(auth *Auth, candidates []string, requestResult thinking.SuffixResult) string {
+	if auth == nil || len(candidates) == 0 {
+		return ""
+	}
+	authID := strings.TrimSpace(auth.ID)
+	if authID == "" {
+		return ""
+	}
+	reg := registry.GetGlobalRegistry()
+	if reg == nil {
+		return ""
+	}
+	models := reg.GetModelsForClient(authID)
+	if len(models) == 0 {
+		return ""
+	}
+	for _, candidate := range candidates {
+		modelKey := canonicalModelKey(candidate)
+		if modelKey == "" {
+			continue
+		}
+		var aliasResolved string
+		for _, model := range models {
+			if model == nil || !strings.EqualFold(strings.TrimSpace(model.ID), modelKey) {
+				continue
+			}
+			target := strings.TrimSpace(model.ExecutionTarget)
+			if target == "" {
+				log.Debugf("[DEBUG] resolveUpstreamModelFromAliasTable: candidate %s is a real registered model for auth %s, returning as-is", candidate, auth.ID)
+				return preserveResolvedModelSuffix(candidate, requestResult)
+			}
+			if aliasResolved == "" {
+				aliasResolved = preserveResolvedModelSuffix(target, requestResult)
+			}
+		}
+		if aliasResolved != "" {
+			log.Debugf("[DEBUG] resolveUpstreamModelFromAliasTable: candidate %s is alias-exposed by auth %s, executing upstream %s", candidate, auth.ID, aliasResolved)
+			return aliasResolved
+		}
+	}
+	return ""
+}
+
 // modelAliasChannel extracts the OAuth model alias channel from an Auth object.
 // It determines the provider and auth kind from the Auth's attributes and delegates
 // to OAuthModelAliasChannel for the actual channel resolution.
@@ -265,7 +351,7 @@ func modelAliasChannel(auth *Auth) string {
 // and auth kind. Returns empty string if the provider/authKind combination doesn't support
 // OAuth model alias (e.g., API key authentication).
 //
-// Supported channels: gemini-cli, vertex, aistudio, antigravity, claude, codex, qwen, iflow, kiro, github-copilot, kimi.
+// Supported channels: gemini-cli, vertex, aistudio, antigravity, claude, codex, qwen, iflow, kiro, github-copilot, kimi, kilo, kilocode.
 func OAuthModelAliasChannel(provider, authKind string) string {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	authKind = strings.ToLower(strings.TrimSpace(authKind))
@@ -289,7 +375,7 @@ func OAuthModelAliasChannel(provider, authKind string) string {
 			return ""
 		}
 		return "codex"
-	case "gemini-cli", "aistudio", "antigravity", "qwen", "iflow", "kiro", "github-copilot", "kimi":
+	case "gemini-cli", "aistudio", "antigravity", "qwen", "iflow", "kiro", "cline", "github-copilot", "kimi", "kilo", "kilocode":
 		return provider
 	default:
 		return ""

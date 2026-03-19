@@ -22,6 +22,7 @@ type RoundRobinSelector struct {
 	mu      sync.Mutex
 	cursors map[string]int
 	maxKeys int
+	Mode    string // "key-based" or empty for default behavior
 }
 
 // FillFirstSelector selects the first available credential (deterministic ordering).

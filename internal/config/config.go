@@ -210,6 +210,22 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	// Mode configures the routing mode.
+	// Supported values: "" (default, provider-scoped), "key-based" (model-only key).
+	Mode string `yaml:"mode,omitempty" json:"mode,omitempty"`
+
+	// FallbackModels maps original model names to fallback model names.
+	// When all credentials for the original model fail with 429/401/5xx,
+	// the request is automatically retried with the fallback model.
+	FallbackModels map[string]string `yaml:"fallback-models,omitempty" json:"fallback-models,omitempty"`
+
+	// FallbackChain is a general fallback chain for models not in FallbackModels.
+	// Models are tried in order when the original model fails.
+	FallbackChain []string `yaml:"fallback-chain,omitempty" json:"fallback-chain,omitempty"`
+
+	// FallbackMaxDepth limits the number of fallback attempts (default: 3).
+	FallbackMaxDepth int `yaml:"fallback-max-depth,omitempty" json:"fallback-max-depth,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -364,7 +380,6 @@ type ClaudeKey struct {
 	APIKey string `yaml:"api-key" json:"api-key"`
 
 	// Priority controls selection preference when multiple credentials match.
-	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
 
 	// Prefix optionally namespaces models for this credential (e.g., "teamA/claude-sonnet-4").
@@ -412,7 +427,6 @@ type CodexKey struct {
 	APIKey string `yaml:"api-key" json:"api-key"`
 
 	// Priority controls selection preference when multiple credentials match.
-	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
 
 	// Prefix optionally namespaces models for this credential (e.g., "teamA/gpt-5-codex").
@@ -460,7 +474,6 @@ type GeminiKey struct {
 	APIKey string `yaml:"api-key" json:"api-key"`
 
 	// Priority controls selection preference when multiple credentials match.
-	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
 
 	// Prefix optionally namespaces models for this credential (e.g., "teamA/gemini-3-pro-preview").
@@ -550,7 +563,6 @@ type OpenAICompatibility struct {
 	Name string `yaml:"name" json:"name"`
 
 	// Priority controls selection preference when multiple providers or credentials match.
-	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
 
 	// Prefix optionally namespaces model aliases for this provider (e.g., "teamA/kimi-k2").
@@ -652,21 +664,18 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
-	// NOTE: Startup legacy key migration is intentionally disabled.
-	// Reason: avoid mutating config.yaml during server startup.
-	// Re-enable the block below if automatic startup migration is needed again.
-	// var legacy legacyConfigData
-	// if errLegacy := yaml.Unmarshal(data, &legacy); errLegacy == nil {
-	// 	if cfg.migrateLegacyGeminiKeys(legacy.LegacyGeminiKeys) {
-	// 		cfg.legacyMigrationPending = true
-	// 	}
-	// 	if cfg.migrateLegacyOpenAICompatibilityKeys(legacy.OpenAICompat) {
-	// 		cfg.legacyMigrationPending = true
-	// 	}
-	// 	if cfg.migrateLegacyAmpConfig(&legacy) {
-	// 		cfg.legacyMigrationPending = true
-	// 	}
-	// }
+	var legacy legacyConfigData
+	if errLegacy := yaml.Unmarshal(data, &legacy); errLegacy == nil {
+		if cfg.migrateLegacyGeminiKeys(legacy.LegacyGeminiKeys) {
+			cfg.legacyMigrationPending = true
+		}
+		if cfg.migrateLegacyOpenAICompatibilityKeys(legacy.OpenAICompat) {
+			cfg.legacyMigrationPending = true
+		}
+		if cfg.migrateLegacyAmpConfig(&legacy) {
+			cfg.legacyMigrationPending = true
+		}
+	}
 
 	// Hash remote management key if plaintext is detected (nested)
 	// We consider a value to be already hashed if it looks like a bcrypt hash ($2a$, $2b$, or $2y$ prefix).
@@ -734,20 +743,17 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 
-	// NOTE: Legacy migration persistence is intentionally disabled together with
-	// startup legacy migration to keep startup read-only for config.yaml.
-	// Re-enable the block below if automatic startup migration is needed again.
-	// if cfg.legacyMigrationPending {
-	// 	fmt.Println("Detected legacy configuration keys, attempting to persist the normalized config...")
-	// 	if !optional && configFile != "" {
-	// 		if err := SaveConfigPreserveComments(configFile, &cfg); err != nil {
-	// 			return nil, fmt.Errorf("failed to persist migrated legacy config: %w", err)
-	// 		}
-	// 		fmt.Println("Legacy configuration normalized and persisted.")
-	// 	} else {
-	// 		fmt.Println("Legacy configuration normalized in memory; persistence skipped.")
-	// 	}
-	// }
+	if cfg.legacyMigrationPending {
+		fmt.Println("Detected legacy configuration keys, attempting to persist the normalized config...")
+		if !optional && configFile != "" {
+			if err := SaveConfigPreserveComments(configFile, &cfg); err != nil {
+				return nil, fmt.Errorf("failed to persist migrated legacy config: %w", err)
+			}
+			fmt.Println("Legacy configuration normalized and persisted.")
+		} else {
+			fmt.Println("Legacy configuration normalized in memory; persistence skipped.")
+		}
+	}
 
 	// Return the populated configuration struct.
 	return &cfg, nil
@@ -820,7 +826,8 @@ func (cfg *Config) SanitizeCodexHeaderDefaults() {
 
 // SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.
 // It trims whitespace, normalizes channel keys to lower-case, drops empty entries,
-// allows multiple aliases per upstream name, and ensures aliases are unique within each channel.
+// allows multiple source models to share the same alias, and ensures each name+alias
+// combination is unique within each channel.
 // It also injects default aliases for channels that have built-in defaults (e.g., kiro)
 // when no user-configured aliases exist for those channels.
 func (cfg *Config) SanitizeOAuthModelAlias() {
@@ -863,7 +870,9 @@ func (cfg *Config) SanitizeOAuthModelAlias() {
 			out[channel] = nil
 			continue
 		}
-		seenAlias := make(map[string]struct{}, len(aliases))
+		// Deduplicate by name+alias combination (not just alias)
+		// This allows multiple source models to share the same alias
+		seenNameAlias := make(map[string]struct{}, len(aliases))
 		clean := make([]OAuthModelAlias, 0, len(aliases))
 		for _, entry := range aliases {
 			name := strings.TrimSpace(entry.Name)
@@ -874,11 +883,12 @@ func (cfg *Config) SanitizeOAuthModelAlias() {
 			if strings.EqualFold(name, alias) {
 				continue
 			}
-			aliasKey := strings.ToLower(alias)
-			if _, ok := seenAlias[aliasKey]; ok {
+			// Deduplicate by name+alias combination (case-insensitive)
+			nameAliasKey := strings.ToLower(name + "::" + alias)
+			if _, ok := seenNameAlias[nameAliasKey]; ok {
 				continue
 			}
-			seenAlias[aliasKey] = struct{}{}
+			seenNameAlias[nameAliasKey] = struct{}{}
 			clean = append(clean, OAuthModelAlias{Name: name, Alias: alias, Fork: entry.Fork})
 		}
 		if len(clean) > 0 {

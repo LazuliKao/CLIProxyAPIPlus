@@ -96,6 +96,8 @@ func main() {
 	var kiroIDCFlow string
 	var githubCopilotLogin bool
 	var codeBuddyLogin bool
+	var kilocodeLogin bool
+	var clineLogin bool
 	var projectID string
 	var vertexImport string
 	var configPath string
@@ -133,6 +135,8 @@ func main() {
 	flag.StringVar(&kiroIDCFlow, "kiro-idc-flow", "", "IDC flow type: authcode (default) or device")
 	flag.BoolVar(&githubCopilotLogin, "github-copilot-login", false, "Login to GitHub Copilot using device flow")
 	flag.BoolVar(&codeBuddyLogin, "codebuddy-login", false, "Login to CodeBuddy using browser OAuth flow")
+	flag.BoolVar(&kilocodeLogin, "kilocode-login", false, "Login to Kilocode using device flow")
+	flag.BoolVar(&clineLogin, "cline-login", false, "Login to Cline using OAuth")
 	flag.StringVar(&projectID, "project_id", "", "Project ID (Gemini only, not required)")
 	flag.StringVar(&configPath, "config", DefaultConfigPath, "Configure File Path")
 	flag.StringVar(&vertexImport, "vertex-import", "", "Import Vertex service account key JSON file")
@@ -519,6 +523,9 @@ func main() {
 	} else if codeBuddyLogin {
 		// Handle CodeBuddy login
 		cmd.DoCodeBuddyLogin(cfg, options)
+	} else if kilocodeLogin {
+		// Handle Kilocode login
+		cmd.DoKilocodeLogin(cfg, options)
 	} else if codexLogin {
 		// Handle Codex login
 		cmd.DoCodexLogin(cfg, options)
@@ -542,6 +549,8 @@ func main() {
 		cmd.DoGitLabTokenLogin(cfg, options)
 	} else if kimiLogin {
 		cmd.DoKimiLogin(cfg, options)
+	} else if clineLogin {
+		cmd.DoClineLogin(cfg, options)
 	} else if kiroLogin {
 		// For Kiro auth, default to incognito mode for multi-account support
 		// Users can explicitly override with --no-incognito

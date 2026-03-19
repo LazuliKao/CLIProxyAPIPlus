@@ -129,8 +129,9 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		Status:   status,
 		Disabled: disabled,
 		Attributes: map[string]string{
-			"source": fullPath,
-			"path":   fullPath,
+			"source":    fullPath,
+			"path":      fullPath,
+			"auth_kind": "oauth",
 		},
 		ProxyURL:  proxyURL,
 		Metadata:  metadata,

@@ -208,15 +208,17 @@ func (b *Builder) Build() (*Service, error) {
 		}
 
 		strategy := ""
+		mode := ""
 		if b.cfg != nil {
 			strategy = strings.ToLower(strings.TrimSpace(b.cfg.Routing.Strategy))
+			mode = strings.ToLower(strings.TrimSpace(b.cfg.Routing.Mode))
 		}
 		var selector coreauth.Selector
 		switch strategy {
 		case "fill-first", "fillfirst", "ff":
 			selector = &coreauth.FillFirstSelector{}
 		default:
-			selector = &coreauth.RoundRobinSelector{}
+			selector = &coreauth.RoundRobinSelector{Mode: mode}
 		}
 
 		coreManager = coreauth.NewManager(tokenStore, selector, nil)
@@ -225,6 +227,8 @@ func (b *Builder) Build() (*Service, error) {
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())
 	coreManager.SetConfig(b.cfg)
 	coreManager.SetOAuthModelAlias(b.cfg.OAuthModelAlias)
+	coreManager.SetFallbackModels(b.cfg.Routing.FallbackModels)
+	coreManager.SetFallbackChain(b.cfg.Routing.FallbackChain, b.cfg.Routing.FallbackMaxDepth)
 
 	service := &Service{
 		cfg:            b.cfg,

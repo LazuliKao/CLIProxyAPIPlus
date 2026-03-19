@@ -473,6 +473,20 @@ func (s *Server) setupRoutes() {
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)
 	})
 
+	s.engine.GET("/cline/callback", func(c *gin.Context) {
+		code := c.Query("code")
+		state := c.Query("state")
+		errStr := c.Query("error")
+		if errStr == "" {
+			errStr = c.Query("error_description")
+		}
+		if state != "" {
+			_, _ = managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, "cline", state, code, errStr)
+		}
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(http.StatusOK, oauthCallbackSuccessHTML)
+	})
+
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
 }
 
@@ -630,6 +644,16 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/routing/strategy", s.mgmt.PutRoutingStrategy)
 		mgmt.PATCH("/routing/strategy", s.mgmt.PutRoutingStrategy)
 
+		mgmt.GET("/routing/mode", s.mgmt.GetRoutingMode)
+		mgmt.PUT("/routing/mode", s.mgmt.PutRoutingMode)
+		mgmt.PATCH("/routing/mode", s.mgmt.PutRoutingMode)
+
+		mgmt.GET("/fallback/models", s.mgmt.GetFallbackModels)
+		mgmt.PUT("/fallback/models", s.mgmt.PutFallbackModels)
+
+		mgmt.GET("/fallback/chain", s.mgmt.GetFallbackChain)
+		mgmt.PUT("/fallback/chain", s.mgmt.PutFallbackChain)
+
 		mgmt.GET("/claude-api-key", s.mgmt.GetClaudeKeys)
 		mgmt.PUT("/claude-api-key", s.mgmt.PutClaudeKeys)
 		mgmt.PATCH("/claude-api-key", s.mgmt.PatchClaudeKey)
@@ -668,6 +692,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
+		mgmt.POST("/auth-files/:id/refresh-tier", s.mgmt.RefreshTier)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
@@ -683,6 +708,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/iflow-auth-url", s.mgmt.RequestIFlowCookieToken)
 		mgmt.GET("/kiro-auth-url", s.mgmt.RequestKiroToken)
 		mgmt.GET("/github-auth-url", s.mgmt.RequestGitHubToken)
+		mgmt.POST("/request-cline-token", s.mgmt.RequestClineToken)
 		mgmt.POST("/oauth-callback", s.mgmt.PostOAuthCallback)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
 	}

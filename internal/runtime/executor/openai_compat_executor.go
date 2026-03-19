@@ -17,8 +17,11 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+const nvidiaCompatTokenReserve int64 = 2
 
 // OpenAICompatExecutor implements a stateless executor for OpenAI-compatible providers.
 // It performs request/response translation and executes against the provider base URL
@@ -94,7 +97,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, opts.Stream)
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, opts.Stream)
+	translated := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), opts.Stream)
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	translated = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel)
 	if opts.Alt == "responses/compact" {
@@ -107,6 +110,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return resp, err
 	}
+	translated = e.applyCompatSafetyMargin(auth, translated)
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
@@ -156,7 +160,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		appendAPIResponseChunk(ctx, e.cfg, b)
-		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		logDetailedAPIError(ctx, e.Identifier(), url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), b)
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return resp, err
 	}
@@ -196,7 +200,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	}
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	translated := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), true)
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	translated = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel)
 
@@ -204,6 +208,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	if err != nil {
 		return nil, err
 	}
+	translated = e.applyCompatSafetyMargin(auth, translated)
 
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
@@ -254,7 +259,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		appendAPIResponseChunk(ctx, e.cfg, b)
-		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		logDetailedAPIError(ctx, e.Identifier(), url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), b)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("openai compat executor: close response body error: %v", errClose)
 		}
@@ -309,7 +314,7 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	translated := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), false)
 
 	modelForCounting := baseModel
 
@@ -376,6 +381,29 @@ func (e *OpenAICompatExecutor) resolveCompatConfig(auth *cliproxyauth.Auth) *con
 		}
 	}
 	return nil
+}
+
+func (e *OpenAICompatExecutor) applyCompatSafetyMargin(auth *cliproxyauth.Auth, payload []byte) []byte {
+	compat := e.resolveCompatConfig(auth)
+	if compat == nil || !strings.EqualFold(strings.TrimSpace(compat.Name), "nvidia-nvapi") {
+		return payload
+	}
+
+	maxTokens := gjson.GetBytes(payload, "max_tokens")
+	if !maxTokens.Exists() {
+		return payload
+	}
+
+	current := maxTokens.Int()
+	if current <= nvidiaCompatTokenReserve {
+		return payload
+	}
+
+	updated, err := sjson.SetBytes(payload, "max_tokens", current-nvidiaCompatTokenReserve)
+	if err != nil {
+		return payload
+	}
+	return updated
 }
 
 func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byte {

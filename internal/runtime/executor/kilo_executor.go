@@ -22,6 +22,11 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+const (
+	kiloVersion      = "3.26.0"
+	kiloTesterHeader = "X-Kilocode-Tester"
+)
+
 // KiloExecutor handles requests to Kilo API.
 type KiloExecutor struct {
 	cfg *config.Config
@@ -106,12 +111,7 @@ func (e *KiloExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	if err != nil {
 		return resp, err
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+accessToken)
-	if orgID != "" {
-		httpReq.Header.Set("X-Kilocode-OrganizationID", orgID)
-	}
-	httpReq.Header.Set("User-Agent", "cli-proxy-kilo")
+	applyKiloHeaders(httpReq, accessToken, orgID, false)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -203,14 +203,7 @@ func (e *KiloExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	if err != nil {
 		return nil, err
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+accessToken)
-	if orgID != "" {
-		httpReq.Header.Set("X-Kilocode-OrganizationID", orgID)
-	}
-	httpReq.Header.Set("User-Agent", "cli-proxy-kilo")
-	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq.Header.Set("Cache-Control", "no-cache")
+	applyKiloHeaders(httpReq, accessToken, orgID, true)
 
 	var attrs map[string]string
 	if auth != nil {
@@ -315,6 +308,8 @@ func kiloCredentials(auth *cliproxyauth.Auth) (accessToken, orgID string) {
 	if auth.Metadata != nil {
 		if token, ok := auth.Metadata["kilocodeToken"].(string); ok && token != "" {
 			accessToken = token
+		} else if token, ok := auth.Metadata["token"].(string); ok && token != "" {
+			accessToken = token
 		} else if token, ok := auth.Metadata["access_token"].(string); ok && token != "" {
 			accessToken = token
 		}
@@ -328,6 +323,8 @@ func kiloCredentials(auth *cliproxyauth.Auth) (accessToken, orgID string) {
 
 	if accessToken == "" && auth.Attributes != nil {
 		if token := auth.Attributes["kilocodeToken"]; token != "" {
+			accessToken = token
+		} else if token := auth.Attributes["token"]; token != "" {
 			accessToken = token
 		} else if token := auth.Attributes["access_token"]; token != "" {
 			accessToken = token
@@ -457,4 +454,24 @@ func FetchKiloModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.C
 	allModels := append(staticModels[:1], dynamicModels...)
 
 	return allModels
+}
+
+func applyKiloHeaders(r *http.Request, token, orgID string, stream bool) {
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Authorization", "Bearer "+token)
+	if orgID != "" {
+		r.Header.Set("X-Kilocode-OrganizationID", orgID)
+	}
+	r.Header.Set("HTTP-Referer", "https://kilocode.ai")
+	r.Header.Set("X-Title", "Kilo Code")
+	r.Header.Set("X-KiloCode-Version", kiloVersion)
+	r.Header.Set("User-Agent", "Kilo-Code/"+kiloVersion)
+	r.Header.Set(kiloTesterHeader, "SUPPRESS")
+	r.Header.Set("X-KiloCode-EditorName", "Visual Studio Code 1.96.0")
+	if stream {
+		r.Header.Set("Accept", "text/event-stream")
+		r.Header.Set("Cache-Control", "no-cache")
+	} else {
+		r.Header.Set("Accept", "application/json")
+	}
 }

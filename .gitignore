@@ -1,6 +1,6 @@
 # Binaries
 cli-proxy-api
-cliproxy
+/cliproxy
 *.exe
 
 
@@ -54,3 +54,8 @@ _bmad-output/*
 .DS_Store
 ._*
 *.bak
+*.json
+.cli-proxy-api/
+.sisyphus/
+.tldr/
+server

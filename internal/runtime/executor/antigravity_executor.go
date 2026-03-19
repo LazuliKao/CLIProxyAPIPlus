@@ -215,7 +215,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	}
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	translated := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), false)
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -242,6 +242,14 @@ attemptLoop:
 				err = errReq
 				return resp, err
 			}
+
+			log.WithFields(log.Fields{
+				"auth_id":  auth.ID,
+				"provider": e.Identifier(),
+				"model":    baseModel,
+				"url":      httpReq.URL.String(),
+				"method":   httpReq.Method,
+			}).Infof("external HTTP request: %s %s", httpReq.Method, httpReq.URL.String())
 
 			httpResp, errDo := httpClient.Do(httpReq)
 			if errDo != nil {
@@ -357,7 +365,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	}
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	translated := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), true)
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -749,7 +757,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	}
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	translated := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), true)
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -950,7 +958,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 	respCtx := context.WithValue(ctx, "alt", opts.Alt)
 
 	// Prepare payload once (doesn't depend on baseURL)
-	payload := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	payload := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), false)
 
 	payload, err := thinking.ApplyThinking(payload, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -964,11 +972,14 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
 
-	var authID, authLabel, authType, authValue string
+	var authID, authLabel, authType, authValue, authTier string
 	if auth != nil {
 		authID = auth.ID
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
+		if tierID, ok := auth.Metadata["tier_id"].(string); ok {
+			authTier = tierID
+		}
 	}
 
 	var lastStatus int
@@ -1011,6 +1022,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 			AuthLabel: authLabel,
 			AuthType:  authType,
 			AuthValue: authValue,
+			Tier:      authTier,
 		})
 
 		httpResp, errDo := httpClient.Do(httpReq)
@@ -1160,6 +1172,11 @@ func (e *AntigravityExecutor) refreshToken(ctx context.Context, auth *cliproxyau
 		return auth, errUnmarshal
 	}
 
+	// Preserve tier info before refresh
+	tierID, _ := auth.Metadata["tier_id"].(string)
+	tierName, _ := auth.Metadata["tier_name"].(string)
+	tierIsPaid, _ := auth.Metadata["tier_is_paid"].(bool)
+
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
@@ -1174,7 +1191,31 @@ func (e *AntigravityExecutor) refreshToken(ctx context.Context, auth *cliproxyau
 	auth.Metadata["type"] = antigravityAuthType
 	if errProject := e.ensureAntigravityProjectID(ctx, auth, tokenResp.AccessToken); errProject != nil {
 		log.Warnf("antigravity executor: ensure project id failed: %v", errProject)
+		log.Infof("antigravity executor: blocking auth %s for 30 minutes due to project id failure", auth.ID)
+		if auth.ModelStates == nil {
+			auth.ModelStates = make(map[string]*cliproxyauth.ModelState)
+		}
+		auth.ModelStates[""] = &cliproxyauth.ModelState{
+			Status:         cliproxyauth.StatusDisabled,
+			Unavailable:    true,
+			NextRetryAfter: time.Now().Add(30 * time.Minute),
+			UpdatedAt:      time.Now(),
+			LastError:      &cliproxyauth.Error{Code: "project_id_failed", Message: errProject.Error()},
+			StatusMessage:  "blocked due to project id failure",
+		}
 	}
+
+	// Restore preserved tier info
+	if tierID != "" {
+		auth.Metadata["tier_id"] = tierID
+	}
+	if tierName != "" {
+		auth.Metadata["tier_name"] = tierName
+	}
+	if tierIsPaid {
+		auth.Metadata["tier_is_paid"] = tierIsPaid
+	}
+
 	return auth, nil
 }
 
@@ -1247,7 +1288,12 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		}
 	}
 	payload = geminiToAntigravity(modelName, payload, projectID)
-	payload, _ = sjson.SetBytes(payload, "model", modelName)
+	resolvedModel := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
+	if resolvedModel == "" {
+		resolvedModel = modelName
+	}
+	payload, _ = sjson.SetBytes(payload, "model", resolvedModel)
+	modelName = resolvedModel
 
 	useAntigravitySchema := strings.Contains(modelName, "claude") || strings.Contains(modelName, "gemini-3-pro") || strings.Contains(modelName, "gemini-3.1-pro")
 	payloadStr := string(payload)
@@ -1294,11 +1340,14 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		httpReq.Host = host
 	}
 
-	var authID, authLabel, authType, authValue string
+	var authID, authLabel, authType, authValue, authTier string
 	if auth != nil {
 		authID = auth.ID
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
+		if tierID, ok := auth.Metadata["tier_id"].(string); ok {
+			authTier = tierID
+		}
 	}
 	var payloadLog []byte
 	if e.cfg != nil && e.cfg.RequestLog {
@@ -1314,6 +1363,7 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		AuthLabel: authLabel,
 		AuthType:  authType,
 		AuthValue: authValue,
+		Tier:      authTier,
 	})
 
 	return httpReq, nil
@@ -1499,7 +1549,25 @@ func resolveCustomAntigravityBaseURL(auth *cliproxyauth.Auth) string {
 }
 
 func geminiToAntigravity(modelName string, payload []byte, projectID string) []byte {
-	template, _ := sjson.Set(string(payload), "model", modelName)
+	requestType := gjson.GetBytes(payload, "requestType").String()
+	if strings.TrimSpace(requestType) == "" {
+		if gjson.GetBytes(payload, "request.tools.0.googleSearch").Exists() {
+			requestType = "web_search"
+		} else {
+			requestType = "agent"
+		}
+	}
+	resolvedModel := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
+	if requestType == "web_search" {
+		if resolvedModel == "" {
+			resolvedModel = "gemini-2.5-flash"
+		}
+	}
+	if resolvedModel == "" {
+		resolvedModel = modelName
+	}
+
+	template, _ := sjson.Set(string(payload), "model", resolvedModel)
 	template, _ = sjson.Set(template, "userAgent", "antigravity")
 
 	isImageModel := strings.Contains(modelName, "image")
@@ -1531,6 +1599,46 @@ func geminiToAntigravity(modelName string, payload []byte, projectID string) []b
 		template, _ = sjson.SetRaw(template, "request.toolConfig", toolConfig.Raw)
 		template, _ = sjson.Delete(template, "toolConfig")
 	}
+	if strings.Contains(modelName, "claude") {
+		template, _ = sjson.Set(template, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+	}
+
+	// Clean tool parameters schema for all models (both Claude and Gemini)
+	// This handles unsupported keywords like anyOf, oneOf, $ref, complex type arrays, etc.
+	gjson.Get(template, "request.tools").ForEach(func(key, tool gjson.Result) bool {
+		tool.Get("functionDeclarations").ForEach(func(funKey, funcDecl gjson.Result) bool {
+			// Check both parametersJsonSchema and parameters fields
+			var paramsRaw string
+			var paramsPath string
+			if funcDecl.Get("parametersJsonSchema").Exists() {
+				paramsRaw = funcDecl.Get("parametersJsonSchema").Raw
+				paramsPath = fmt.Sprintf("request.tools.%d.functionDeclarations.%d.parametersJsonSchema", key.Int(), funKey.Int())
+			} else if funcDecl.Get("parameters").Exists() {
+				paramsRaw = funcDecl.Get("parameters").Raw
+				paramsPath = fmt.Sprintf("request.tools.%d.functionDeclarations.%d.parameters", key.Int(), funKey.Int())
+			}
+
+			if paramsRaw != "" {
+				// Clean the schema to be compatible with Gemini API
+				cleanedSchema := util.CleanJSONSchemaForAntigravity(paramsRaw)
+				// Set to parameters field (Gemini API expects "parameters", not "parametersJsonSchema")
+				template, _ = sjson.SetRaw(template, fmt.Sprintf("request.tools.%d.functionDeclarations.%d.parameters", key.Int(), funKey.Int()), cleanedSchema)
+				// Remove $schema if present
+				template, _ = sjson.Delete(template, fmt.Sprintf("request.tools.%d.functionDeclarations.%d.parameters.$schema", key.Int(), funKey.Int()))
+				// Remove parametersJsonSchema if it was the source
+				if paramsPath != fmt.Sprintf("request.tools.%d.functionDeclarations.%d.parameters", key.Int(), funKey.Int()) {
+					template, _ = sjson.Delete(template, paramsPath)
+				}
+			}
+			return true
+		})
+		return true
+	})
+
+	if !strings.Contains(modelName, "claude") {
+		template, _ = sjson.Delete(template, "request.generationConfig.maxOutputTokens")
+	}
+
 	return []byte(template)
 }
 
