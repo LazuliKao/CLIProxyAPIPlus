@@ -3,7 +3,9 @@ package auth
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kilocode"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/browser"
@@ -83,7 +85,7 @@ func (a KilocodeAuthenticator) Login(ctx context.Context, cfg *config.Config, op
 		"timestamp": time.Now().UnixMilli(),
 	}
 
-	fileName := fmt.Sprintf("kilocode-%s.json", authBundle.UserID)
+	fileName := kilocodeCredentialFileName(authBundle.UserID)
 	label := authBundle.UserEmail
 	if label == "" {
 		label = authBundle.UserID
@@ -102,4 +104,38 @@ func (a KilocodeAuthenticator) Login(ctx context.Context, cfg *config.Config, op
 			"auth_kind": "oauth",
 		},
 	}, nil
+}
+
+func kilocodeCredentialFileName(userID string) string {
+	return fmt.Sprintf("kilocode-%s.json", sanitizeKilocodeFilePart(userID))
+}
+
+func sanitizeKilocodeFilePart(value string) string {
+	const fallback = "user"
+
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+
+	var builder strings.Builder
+	lastDash := false
+	for _, r := range value {
+		switch {
+		case unicode.IsLetter(r), unicode.IsDigit(r), r == '-', r == '_':
+			builder.WriteRune(r)
+			lastDash = false
+		default:
+			if !lastDash {
+				builder.WriteRune('-')
+				lastDash = true
+			}
+		}
+	}
+
+	result := strings.Trim(builder.String(), "-_")
+	if result == "" {
+		return fallback
+	}
+	return result
 }
