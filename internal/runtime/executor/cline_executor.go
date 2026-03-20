@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	clineVersion        = "3.0.0"
+	clineVersion        = "3.74.0"
 	clineBaseURL        = "https://api.cline.bot/api/v1"
 	clineModelsEndpoint = "/ai/cline/models"
 	clineChatEndpoint   = "/chat/completions"

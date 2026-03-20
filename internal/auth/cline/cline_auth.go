@@ -86,7 +86,7 @@ func (c *ClineAuth) ExchangeCode(ctx context.Context, code, redirectURI string) 
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Cline/3.0.0")
+	req.Header.Set("User-Agent", "Cline/3.74.0")
 	req.Header.Set("HTTP-Referer", "https://cline.bot")
 	req.Header.Set("X-Title", "Cline")
 
@@ -133,7 +133,7 @@ func (c *ClineAuth) RefreshToken(ctx context.Context, refreshToken string) (*Tok
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Cline/3.0.0")
+	req.Header.Set("User-Agent", "Cline/3.74.0")
 	req.Header.Set("HTTP-Referer", "https://cline.bot")
 	req.Header.Set("X-Title", "Cline")
 
