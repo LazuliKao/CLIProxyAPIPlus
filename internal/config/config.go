@@ -368,8 +368,8 @@ type CloakConfig struct {
 type CopilotConfig struct {
 	// MergeToolBlocks enables merging tool_result and text blocks.
 	MergeToolBlocks bool `yaml:"merge-tool-blocks,omitempty" json:"merge-tool-blocks,omitempty"`
-	// TransformUserToDeveloper enables transforming user messages to developer messages.
-	TransformUserToDeveloper bool `yaml:"transform-user-messages,omitempty" json:"transform-user-messages,omitempty"`
+	// TransformUserMessages enables transforming user messages to developer messages.
+	TransformUserMessages bool `yaml:"transform-user-messages,omitempty" json:"transform-user-messages,omitempty"`
 }
 
 // CodexConfig configures Codex billing optimization features.
@@ -664,7 +664,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	cfg.IncognitoBrowser = false // Default to normal browser (AWS uses incognito by force)
 	cfg.Copilot.MergeToolBlocks = true
-	cfg.Copilot.TransformUserToDeveloper = false
+	cfg.Copilot.TransformUserMessages = false
 	cfg.Codex.MergeToolBlocks = true
 	cfg.Codex.TransformUserMessages = false
 	if err = yaml.Unmarshal(data, &cfg); err != nil {

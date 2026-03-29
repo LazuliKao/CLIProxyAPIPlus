@@ -130,7 +130,7 @@ func (e *GitHubCopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.
 	if e.cfg.Copilot.MergeToolBlocks {
 		body = mergeToolResultBlocks(body)
 	}
-	if e.cfg.Copilot.TransformUserToDeveloper {
+	if e.cfg.Copilot.TransformUserMessages {
 		body = transformUserToToolResponse(body)
 	}
 
@@ -267,7 +267,7 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	if e.cfg.Copilot.MergeToolBlocks {
 		body = mergeToolResultBlocks(body)
 	}
-	if e.cfg.Copilot.TransformUserToDeveloper {
+	if e.cfg.Copilot.TransformUserMessages {
 		body = transformUserToToolResponse(body)
 	}
 
@@ -1521,11 +1521,12 @@ func transformUserToToolResponse(body []byte) []byte {
 		}
 
 		for _, t := range toolUses {
+			randomFunctionName := generateRandomFunctionName()
 			toolCalls = append(toolCalls, map[string]interface{}{
 				"id":   t.toolCallID,
 				"type": "function",
 				"function": map[string]interface{}{
-					"name":      "ask_user",
+					"name":      randomFunctionName,
 					"arguments": "{}",
 				},
 			})
@@ -1583,7 +1584,7 @@ func transformUserToToolResponse(body []byte) []byte {
 				for _, part := range content.Array() {
 					if typ := part.Get("type").String(); typ == "text" {
 						if text := part.Get("text").String(); text != "" {
-							textParts = append(textParts, text)
+							textParts = append(textParts, "User Input：" + text)
 						}
 					}
 				}
@@ -1605,6 +1606,33 @@ func randomID() string {
 	}
 	return fmt.Sprintf("%x", b)
 }
+
+// generateRandomFunctionName creates a random function name to disguise tool calls
+func generateRandomFunctionName() string {
+	// Create a random function name that looks like a legitimate function but is disguised
+	prefixOptions := []string{"helper_", "process_", "handle_", "execute_", "invoke_", "call_", "run_", "trigger_"}
+	suffixOptions := []string{"_callback", "_action", "_request", "_task", "_operation", "_feedback", "_response", "_interaction"}
+
+	// Generate random indices using crypto/rand
+	var randomBytes [4]byte
+	_, err := rand.Read(randomBytes[:])
+	if err != nil {
+		// Fallback to time-based if crypto/rand fails
+		return fmt.Sprintf("helper_temp_%x_feedback", time.Now().UnixNano()&0xFFFF)
+	}
+
+	prefixIndex := int(randomBytes[0]) % len(prefixOptions)
+	suffixIndex := int(randomBytes[1]) % len(suffixOptions)
+
+	prefix := prefixOptions[prefixIndex]
+	suffix := suffixOptions[suffixIndex]
+
+	// Add a random component
+	randomComponent := fmt.Sprintf("temp_%x", time.Now().UnixNano()&0xFFFF)
+
+	return prefix + randomComponent + suffix
+}
+
 const (
 	// defaultCopilotContextLength is the default context window for unknown Copilot models.
 	defaultCopilotContextLength = 128000
