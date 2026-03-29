@@ -130,7 +130,7 @@ func (e *GitHubCopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.
 	if e.cfg.Copilot.MergeToolBlocks {
 		body = mergeToolResultBlocks(body)
 	}
-	if e.cfg.Copilot.TransformUserToDeveloper {
+	if e.cfg.Copilot.TransformUserMessages {
 		body = transformUserToToolResponse(body)
 	}
 
@@ -267,7 +267,7 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	if e.cfg.Copilot.MergeToolBlocks {
 		body = mergeToolResultBlocks(body)
 	}
-	if e.cfg.Copilot.TransformUserToDeveloper {
+	if e.cfg.Copilot.TransformUserMessages {
 		body = transformUserToToolResponse(body)
 	}
 
@@ -1605,6 +1605,7 @@ func randomID() string {
 	}
 	return fmt.Sprintf("%x", b)
 }
+
 const (
 	// defaultCopilotContextLength is the default context window for unknown Copilot models.
 	defaultCopilotContextLength = 128000
