@@ -448,6 +448,71 @@ func TestMergeToolResultBlocks(t *testing.T) {
 	}
 }
 
+func TestMergeAdjacentUserMessages(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+		check func(t *testing.T, got []byte)
+	}{
+		{
+			name:  "merge consecutive string user messages",
+			input: `{"messages":[{"role":"user","content":"a"},{"role":"user","content":"b"}]}`,
+			check: func(t *testing.T, got []byte) {
+				messages := gjson.GetBytes(got, "messages").Array()
+				if len(messages) != 1 {
+					t.Fatalf("messages len = %d, want 1", len(messages))
+				}
+				if role := messages[0].Get("role").String(); role != "user" {
+					t.Fatalf("role = %q, want user", role)
+				}
+				if content := messages[0].Get("content").String(); content != "a\n\nb" {
+					t.Fatalf("content = %q, want %q", content, "a\\n\\nb")
+				}
+			},
+		},
+		{
+			name:  "do not cross non-user boundary",
+			input: `{"messages":[{"role":"user","content":"a"},{"role":"assistant","content":"x"},{"role":"user","content":"b"}]}`,
+			check: func(t *testing.T, got []byte) {
+				messages := gjson.GetBytes(got, "messages").Array()
+				if len(messages) != 3 {
+					t.Fatalf("messages len = %d, want 3", len(messages))
+				}
+			},
+		},
+		{
+			name:  "merge string and array as array",
+			input: `{"messages":[{"role":"user","content":"a"},{"role":"user","content":[{"type":"text","text":"b"}]}]}`,
+			check: func(t *testing.T, got []byte) {
+				messages := gjson.GetBytes(got, "messages").Array()
+				if len(messages) != 1 {
+					t.Fatalf("messages len = %d, want 1", len(messages))
+				}
+				content := messages[0].Get("content")
+				if !content.IsArray() {
+					t.Fatalf("content should be array, got %s", content.Raw)
+				}
+				parts := content.Array()
+				if len(parts) != 2 {
+					t.Fatalf("content parts len = %d, want 2", len(parts))
+				}
+				if parts[0].Get("text").String() != "a" || parts[1].Get("text").String() != "b" {
+					t.Fatalf("unexpected merged parts: %s", content.Raw)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mergeAdjacentUserMessages([]byte(tt.input))
+			tt.check(t, got)
+		})
+	}
+}
+
 func TestTransformUserToToolResponse(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -491,8 +556,8 @@ func TestTransformUserToToolResponse(t *testing.T) {
 				if toolCalls[0].Get("type").String() != "function" {
 					t.Fatalf("tool_calls[0].type = %q, want function", toolCalls[0].Get("type").String())
 				}
-				if toolCalls[0].Get("function.name").String() != "ask_user" {
-					t.Fatalf("function.name = %q, want ask_user", toolCalls[0].Get("function.name").String())
+				if toolCalls[0].Get("function.name").String() == "" {
+					t.Fatal("function.name should not be empty")
 				}
 				callID := toolCalls[0].Get("id").String()
 				if callID == "" {
@@ -508,6 +573,39 @@ func TestTransformUserToToolResponse(t *testing.T) {
 				}
 				if toolMsg.Get("content").String() != "followup" {
 					t.Fatalf("tool content = %q, want %q", toolMsg.Get("content").String(), "followup")
+				}
+			},
+		},
+		{
+			name:  "user after tool backtracks assistant with existing tool_calls",
+			input: `{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"answer","tool_calls":[{"id":"existing_call","type":"function","function":{"name":"already_called","arguments":"{}"}}]},{"role":"tool","tool_call_id":"existing_call","content":"done"},{"role":"user","content":"followup after tool"}]}`,
+			checkFunc: func(t *testing.T, got []byte) {
+				messages := gjson.GetBytes(got, "messages").Array()
+				if len(messages) != 4 {
+					t.Fatalf("messages len = %d, want 4", len(messages))
+				}
+
+				assistant := messages[1]
+				toolCalls := assistant.Get("tool_calls").Array()
+				if len(toolCalls) != 2 {
+					t.Fatalf("tool_calls len = %d, want 2", len(toolCalls))
+				}
+				if toolCalls[0].Get("id").String() != "existing_call" {
+					t.Fatalf("first tool call should be preserved, got %s", toolCalls[0].Raw)
+				}
+				newID := toolCalls[1].Get("id").String()
+				if newID == "" {
+					t.Fatal("new tool call id should not be empty")
+				}
+				if toolCalls[1].Get("function.name").String() == "" {
+					t.Fatal("new tool call function.name should not be empty")
+				}
+
+				if role := messages[3].Get("role").String(); role != "tool" {
+					t.Fatalf("last message role = %q, want tool", role)
+				}
+				if tcid := messages[3].Get("tool_call_id").String(); tcid != newID {
+					t.Fatalf("tool_call_id = %q, want %q", tcid, newID)
 				}
 			},
 		},

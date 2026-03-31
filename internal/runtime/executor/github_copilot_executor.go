@@ -127,6 +127,9 @@ func (e *GitHubCopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
 	body = e.normalizeModel(req.Model, body)
 	body = flattenAssistantContent(body)
+	if e.cfg.Copilot.MergeAdjacentUserMessages {
+		body = mergeAdjacentUserMessages(body)
+	}
 	if e.cfg.Copilot.MergeToolBlocks {
 		body = mergeToolResultBlocks(body)
 	}
@@ -264,6 +267,9 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
 	body = e.normalizeModel(req.Model, body)
 	body = flattenAssistantContent(body)
+	if e.cfg.Copilot.MergeAdjacentUserMessages {
+		body = mergeAdjacentUserMessages(body)
+	}
 	if e.cfg.Copilot.MergeToolBlocks {
 		body = mergeToolResultBlocks(body)
 	}
@@ -1332,6 +1338,103 @@ func isHTTPSuccess(statusCode int) bool {
 	return statusCode >= 200 && statusCode < 300
 }
 
+// mergeAdjacentUserMessages merges consecutive user messages into one message.
+// This runs before other Copilot transforms so downstream steps can operate on
+// a more compact user message sequence.
+func mergeAdjacentUserMessages(body []byte) []byte {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body
+	}
+
+	arr := messages.Array()
+	if len(arr) < 2 {
+		return body
+	}
+
+	newMessages := "[]"
+	for i := 0; i < len(arr); i++ {
+		current := arr[i]
+		if current.Get("role").String() != "user" {
+			newMessages, _ = sjson.SetRaw(newMessages, "-1", current.Raw)
+			continue
+		}
+
+		merged := current.Raw
+		for i+1 < len(arr) && arr[i+1].Get("role").String() == "user" {
+			next := arr[i+1]
+			merged = mergeAdjacentUserMessageContent(merged, next)
+			i++
+		}
+
+		newMessages, _ = sjson.SetRaw(newMessages, "-1", merged)
+	}
+
+	result, _ := sjson.SetRawBytes(body, "messages", []byte(newMessages))
+	return result
+}
+
+func mergeAdjacentUserMessageContent(currentRaw string, next gjson.Result) string {
+	currentContent := gjson.Get(currentRaw, "content")
+	nextContent := next.Get("content")
+
+	if !nextContent.Exists() {
+		return currentRaw
+	}
+
+	if currentContent.Type == gjson.String && nextContent.Type == gjson.String {
+		left := currentContent.String()
+		right := nextContent.String()
+		switch {
+		case left == "":
+			updated, _ := sjson.Set(currentRaw, "content", right)
+			return updated
+		case right == "":
+			return currentRaw
+		default:
+			updated, _ := sjson.Set(currentRaw, "content", left+"\n\n"+right)
+			return updated
+		}
+	}
+
+	toContentArray := func(content gjson.Result) string {
+		if !content.Exists() {
+			return "[]"
+		}
+		if content.IsArray() {
+			return content.Raw
+		}
+		if content.Type == gjson.String {
+			text := content.String()
+			if text == "" {
+				return "[]"
+			}
+			textBlock := `{"type":"text","text":""}`
+			textBlock, _ = sjson.Set(textBlock, "text", text)
+			arr := "[]"
+			arr, _ = sjson.SetRaw(arr, "-1", textBlock)
+			return arr
+		}
+		text := content.String()
+		if text == "" {
+			return "[]"
+		}
+		textBlock := `{"type":"text","text":""}`
+		textBlock, _ = sjson.Set(textBlock, "text", text)
+		arr := "[]"
+		arr, _ = sjson.SetRaw(arr, "-1", textBlock)
+		return arr
+	}
+
+	mergedArray := toContentArray(currentContent)
+	for _, item := range gjson.Parse(toContentArray(nextContent)).Array() {
+		mergedArray, _ = sjson.SetRaw(mergedArray, "-1", item.Raw)
+	}
+
+	updated, _ := sjson.SetRaw(currentRaw, "content", mergedArray)
+	return updated
+}
+
 // mergeToolResultBlocks merges tool_result and text blocks in user messages
 // to reduce GitHub Copilot Premium request billing.
 func mergeToolResultBlocks(body []byte) []byte {
@@ -1471,6 +1574,7 @@ func transformUserToToolResponse(body []byte) []byte {
 		if lastAssistantIdx >= 0 {
 			// Skip if the assistant already has real tool_use content blocks or tool_calls
 			assistantMsg := arr[lastAssistantIdx]
+			userFollowsTool := i > 0 && arr[i-1].Get("role").String() == "tool"
 			assistantContent := assistantMsg.Get("content")
 			if assistantContent.IsArray() {
 				hasToolUse := false
@@ -1484,7 +1588,7 @@ func transformUserToToolResponse(body []byte) []byte {
 					continue
 				}
 			}
-			if assistantMsg.Get("tool_calls").IsArray() {
+			if assistantMsg.Get("tool_calls").IsArray() && !userFollowsTool {
 				continue
 			}
 
@@ -1584,7 +1688,7 @@ func transformUserToToolResponse(body []byte) []byte {
 				for _, part := range content.Array() {
 					if typ := part.Get("type").String(); typ == "text" {
 						if text := part.Get("text").String(); text != "" {
-							textParts = append(textParts, "User Input：" + text)
+							textParts = append(textParts, "User Input："+text)
 						}
 					}
 				}

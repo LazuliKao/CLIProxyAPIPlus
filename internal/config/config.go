@@ -366,6 +366,8 @@ type CloakConfig struct {
 
 // CopilotConfig configures Copilot Premium optimization features.
 type CopilotConfig struct {
+	// MergeAdjacentUserMessages enables merging adjacent user messages before other transforms.
+	MergeAdjacentUserMessages bool `yaml:"merge-adjacent-user-messages,omitempty" json:"merge-adjacent-user-messages,omitempty"`
 	// MergeToolBlocks enables merging tool_result and text blocks.
 	MergeToolBlocks bool `yaml:"merge-tool-blocks,omitempty" json:"merge-tool-blocks,omitempty"`
 	// TransformUserMessages enables transforming user messages to developer messages.
@@ -663,6 +665,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	cfg.IncognitoBrowser = false // Default to normal browser (AWS uses incognito by force)
+	cfg.Copilot.MergeAdjacentUserMessages = true
 	cfg.Copilot.MergeToolBlocks = true
 	cfg.Copilot.TransformUserMessages = false
 	cfg.Codex.MergeToolBlocks = true
@@ -1452,6 +1455,8 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 	// Check boolean defaults
 	if node.Kind == yaml.ScalarNode && node.Tag == "!!bool" {
 		switch fullPath {
+		case "copilot.merge-adjacent-user-messages":
+			return node.Value == "true"
 		case "copilot.merge-tool-blocks":
 			return node.Value == "true"
 		}

@@ -395,6 +395,12 @@ nonstream-keepalive-interval: 0
 #   github-copilot:
 #     - "raptor-mini"
 
+# Optional GitHub Copilot request-shaping optimizations
+# copilot:
+#   merge-adjacent-user-messages: true # merge consecutive user messages first
+#   merge-tool-blocks: true             # then merge tool_result + text blocks in a single user message
+#   transform-user-messages: false      # finally, convert follow-up user messages to tool responses
+
 # Optional payload configuration
 # payload:
 #   default: # Default rules only set parameters when they are missing in the payload.
