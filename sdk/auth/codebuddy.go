@@ -46,7 +46,12 @@ func (a CodeBuddyAuthenticator) Login(ctx context.Context, cfg *config.Config, o
 		ctx = context.Background()
 	}
 
-	authSvc := codebuddy.NewCodeBuddyAuth(cfg)
+	// 从登录选项读取站点配置
+	useGlobal := false
+	if val, ok := opts.Metadata["useGlobal"]; ok && val == "true" {
+		useGlobal = true
+	}
+	authSvc := codebuddy.NewCodeBuddyAuthWithEndpoint(cfg, useGlobal)
 
 	authState, err := authSvc.FetchAuthState(ctx)
 	if err != nil {

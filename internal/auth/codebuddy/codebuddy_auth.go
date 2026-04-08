@@ -43,11 +43,32 @@ type CodeBuddyAuth struct {
 }
 
 func NewCodeBuddyAuth(cfg *config.Config) *CodeBuddyAuth {
+	return NewCodeBuddyAuthWithEndpoint(cfg, false)
+}
+
+// NewCodeBuddyAuthWithDomain 创建CodeBuddy认证实例，通过域名选择对应端点
+func NewCodeBuddyAuthWithDomain(cfg *config.Config, domain string) *CodeBuddyAuth {
 	httpClient := &http.Client{Timeout: 30 * time.Second}
 	if cfg != nil {
 		httpClient = util.SetProxy(&cfg.SDKConfig, httpClient)
 	}
-	return &CodeBuddyAuth{httpClient: httpClient, cfg: cfg, baseURL: BaseURL}
+	baseURL := BaseURL
+	// 完全与RefreshToken保持一致的域名判断逻辑
+	if domain == DefaultDomainGlobal {
+		baseURL = BaseURLGlobal
+	} else {
+		baseURL = BaseURL
+	}
+	return &CodeBuddyAuth{httpClient: httpClient, cfg: cfg, baseURL: baseURL}
+}
+
+// NewCodeBuddyAuthWithEndpoint 创建CodeBuddy认证实例，可指定使用全球站点
+func NewCodeBuddyAuthWithEndpoint(cfg *config.Config, useGlobal bool) *CodeBuddyAuth {
+	domain := DefaultDomain
+	if useGlobal {
+		domain = DefaultDomainGlobal
+	}
+	return NewCodeBuddyAuthWithDomain(cfg, domain)
 }
 
 // AuthState holds the state and auth URL returned by the auth state API.
@@ -70,7 +91,14 @@ func (a *CodeBuddyAuth) FetchAuthState(ctx context.Context) (*AuthState, error) 
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("X-Domain", "copilot.tencent.com")
+	// 根据域名配置设置正确的X-Domain头
+	var currentDomain string
+	if a.baseURL == BaseURLGlobal {
+		currentDomain = DefaultDomainGlobal
+	} else {
+		currentDomain = DefaultDomain
+	}
+	req.Header.Set("X-Domain", currentDomain)
 	req.Header.Set("X-No-Authorization", "true")
 	req.Header.Set("X-No-User-Id", "true")
 	req.Header.Set("X-No-Enterprise-Id", "true")
