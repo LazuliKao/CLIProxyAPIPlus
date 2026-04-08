@@ -20,6 +20,9 @@ import (
 )
 
 const (
+	BaseURLGlobal       = "https://www.codebuddy.ai/"
+	DefaultDomainGlobal = "www.codebuddy.ai"
+
 	BaseURL       = "https://copilot.tencent.com"
 	DefaultDomain = "www.codebuddy.cn"
 	UserAgent     = "CLI/2.63.2 CodeBuddy/2.63.2"
@@ -63,7 +66,7 @@ func (a *CodeBuddyAuth) FetchAuthState(ctx context.Context) (*AuthState, error) 
 		return nil, fmt.Errorf("codebuddy: failed to create auth state request: %w", err)
 	}
 
-requestID := uuid.NewString()
+	requestID := uuid.NewString()
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
@@ -236,6 +239,12 @@ func (a *CodeBuddyAuth) DecodeUserID(accessToken string) (string, error) {
 func (a *CodeBuddyAuth) RefreshToken(ctx context.Context, accessToken, refreshToken, userID, domain string) (*CodeBuddyTokenStorage, error) {
 	if domain == "" {
 		domain = DefaultDomain
+	}
+	// 自动根据域名选择对应服务端点
+	if domain == DefaultDomainGlobal {
+		a.baseURL = BaseURLGlobal
+	} else {
+		a.baseURL = BaseURL
 	}
 	refreshURL := fmt.Sprintf("%s%s", a.baseURL, codeBuddyRefreshPath)
 	body := []byte("{}")

@@ -91,6 +91,14 @@ func (e *CodeBuddyExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 		return resp, fmt.Errorf("codebuddy: missing access token")
 	}
 
+	// 根据域名自动切换服务端点
+	var baseURL string
+	if domain == codebuddy.DefaultDomainGlobal {
+		baseURL = codebuddy.BaseURLGlobal
+	} else {
+		baseURL = codebuddy.BaseURL
+	}
+
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
 
@@ -108,7 +116,7 @@ func (e *CodeBuddyExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 		return resp, err
 	}
 
-	url := codebuddy.BaseURL + codeBuddyChatPath
+	url := baseURL + codeBuddyChatPath
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return resp, err
@@ -181,6 +189,14 @@ func (e *CodeBuddyExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 		return nil, fmt.Errorf("codebuddy: missing access token")
 	}
 
+	// 根据域名自动切换服务端点
+	var baseURL string
+	if domain == codebuddy.DefaultDomainGlobal {
+		baseURL = codebuddy.BaseURLGlobal
+	} else {
+		baseURL = codebuddy.BaseURL
+	}
+
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
 
@@ -198,7 +214,7 @@ func (e *CodeBuddyExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 		return nil, err
 	}
 
-	url := codebuddy.BaseURL + codeBuddyChatPath
+	url := baseURL + codeBuddyChatPath
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return nil, err
