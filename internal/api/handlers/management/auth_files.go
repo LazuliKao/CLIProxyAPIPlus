@@ -261,8 +261,28 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	}
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
+	antigravityFallbackOrder := 1
+	antigravityPrimaryAssigned := false
 	for _, auth := range auths {
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
+			if primaryInfo, ok := entry["primary_info"].(gin.H); ok {
+				if isPrimary, ok := primaryInfo["is_primary"].(bool); ok && isPrimary {
+					antigravityPrimaryAssigned = true
+				}
+				if orderValue, ok := primaryInfo["order"].(int); ok && orderValue >= antigravityFallbackOrder {
+					antigravityFallbackOrder = orderValue + 1
+				}
+			} else {
+				entry = ensureAntigravityPrimaryInfoEntry(entry, auth, antigravityFallbackOrder, antigravityPrimaryAssigned)
+				if primaryInfo, ok := entry["primary_info"].(gin.H); ok {
+					if isPrimary, ok := primaryInfo["is_primary"].(bool); ok && isPrimary {
+						antigravityPrimaryAssigned = true
+					}
+					if orderValue, ok := primaryInfo["order"].(int); ok && orderValue >= antigravityFallbackOrder {
+						antigravityFallbackOrder = orderValue + 1
+					}
+				}
+			}
 			files = append(files, entry)
 		}
 	}
@@ -272,6 +292,24 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
 	c.JSON(200, gin.H{"files": files})
+}
+
+func ensureAntigravityPrimaryInfoEntry(entry gin.H, auth *coreauth.Auth, fallbackOrder int, primaryAlreadyAssigned bool) gin.H {
+	if entry == nil || auth == nil {
+		return entry
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+		return entry
+	}
+	if _, exists := entry["primary_info"]; exists {
+		return entry
+	}
+	isPrimary := !primaryAlreadyAssigned && !auth.Disabled && auth.Status != coreauth.StatusDisabled
+	entry["primary_info"] = gin.H{
+		"is_primary": isPrimary,
+		"order":      fallbackOrder,
+	}
+	return entry
 }
 
 // GetAuthFileModels returns the models supported by a specific auth file
@@ -348,6 +386,17 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				emailValue := gjson.GetBytes(data, "email").String()
 				fileData["type"] = typeValue
 				fileData["email"] = emailValue
+				if dv := gjson.GetBytes(data, "disabled"); dv.Exists() {
+					fileData["disabled"] = dv.Bool()
+				}
+				if strings.EqualFold(strings.TrimSpace(typeValue), "antigravity") {
+					if pv := gjson.GetBytes(data, "primary_info.is_primary"); pv.Exists() {
+						fileData["primary_info"] = gin.H{
+							"is_primary": pv.Bool(),
+							"order":      int(gjson.GetBytes(data, "primary_info.order").Int()),
+						}
+					}
+				}
 				if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
 					switch pv.Type {
 					case gjson.Number:
@@ -361,6 +410,15 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				if nv := gjson.GetBytes(data, "note"); nv.Exists() && nv.Type == gjson.String {
 					if trimmed := strings.TrimSpace(nv.String()); trimmed != "" {
 						fileData["note"] = trimmed
+					}
+				}
+				if bv := gjson.GetBytes(data, "billing_class"); bv.Exists() && bv.Type == gjson.String {
+					if normalized := normalizeBillingClassValue(bv.String()); normalized != "" {
+						fileData["billing_class"] = normalized
+					}
+				} else if bv := gjson.GetBytes(data, "billing-class"); bv.Exists() && bv.Type == gjson.String {
+					if normalized := normalizeBillingClassValue(bv.String()); normalized != "" {
+						fileData["billing_class"] = normalized
 					}
 				}
 			}
@@ -477,7 +535,52 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			}
 		}
 	}
+	if billingClass := strings.TrimSpace(authAttribute(auth, "billing_class")); billingClass != "" {
+		entry["billing_class"] = billingClass
+	} else if auth.Metadata != nil {
+		if rawBillingClass, ok := auth.Metadata["billing_class"].(string); ok {
+			if normalized := normalizeBillingClassValue(rawBillingClass); normalized != "" {
+				entry["billing_class"] = normalized
+			}
+		} else if rawBillingClass, ok := auth.Metadata["billing-class"].(string); ok {
+			if normalized := normalizeBillingClassValue(rawBillingClass); normalized != "" {
+				entry["billing_class"] = normalized
+			}
+		}
+	}
+	if auth.PrimaryInfo != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+		entry["primary_info"] = gin.H{
+			"is_primary": auth.PrimaryInfo.IsPrimary,
+			"order":      auth.PrimaryInfo.Order,
+		}
+	}
 	return entry
+}
+
+func extractPrimaryInfoFromMetadata(metadata map[string]any) *coreauth.PrimaryInfo {
+	if metadata == nil {
+		return nil
+	}
+	rawPrimaryInfo, ok := metadata["primary_info"]
+	if !ok {
+		return nil
+	}
+	primaryInfoMap, ok := rawPrimaryInfo.(map[string]any)
+	if !ok {
+		return nil
+	}
+	isPrimary, ok := primaryInfoMap["is_primary"].(bool)
+	if !ok {
+		return nil
+	}
+	order := 0
+	switch value := primaryInfoMap["order"].(type) {
+	case float64:
+		order = int(value)
+	case int:
+		order = value
+	}
+	return &coreauth.PrimaryInfo{IsPrimary: isPrimary, Order: order}
 }
 
 func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {
@@ -1037,8 +1140,48 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		CreatedAt:  time.Now(),
 		UpdatedAt:  time.Now(),
 	}
+	if disabled, ok := metadata["disabled"].(bool); ok && disabled {
+		auth.Disabled = true
+		auth.Status = coreauth.StatusDisabled
+	}
 	if hasLastRefresh {
 		auth.LastRefreshedAt = lastRefresh
+	}
+	if rawPriority, ok := metadata["priority"]; ok {
+		switch v := rawPriority.(type) {
+		case float64:
+			auth.Attributes["priority"] = strconv.Itoa(int(v))
+		case int:
+			auth.Attributes["priority"] = strconv.Itoa(v)
+		case string:
+			priority := strings.TrimSpace(v)
+			if _, errAtoi := strconv.Atoi(priority); errAtoi == nil {
+				auth.Attributes["priority"] = priority
+			}
+		}
+	}
+	if rawNote, ok := metadata["note"]; ok {
+		if note, isStr := rawNote.(string); isStr {
+			if trimmed := strings.TrimSpace(note); trimmed != "" {
+				auth.Attributes["note"] = trimmed
+			}
+		}
+	}
+	if rawBillingClass, ok := metadata["billing_class"]; ok {
+		if billingClass, isStr := rawBillingClass.(string); isStr {
+			if normalized := normalizeBillingClassValue(billingClass); normalized != "" {
+				auth.Attributes["billing_class"] = normalized
+			}
+		}
+	} else if rawBillingClass, ok := metadata["billing-class"]; ok {
+		if billingClass, isStr := rawBillingClass.(string); isStr {
+			if normalized := normalizeBillingClassValue(billingClass); normalized != "" {
+				auth.Attributes["billing_class"] = normalized
+			}
+		}
+	}
+	if primaryInfo := extractPrimaryInfoFromMetadata(metadata); primaryInfo != nil && strings.EqualFold(strings.TrimSpace(provider), "antigravity") {
+		auth.PrimaryInfo = primaryInfo
 	}
 	if h != nil && h.authManager != nil {
 		if existing, ok := h.authManager.GetByID(authID); ok {
@@ -1050,6 +1193,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 			auth.Runtime = existing.Runtime
 		}
 	}
+	coreauth.ApplyCustomHeadersFromMetadata(auth)
 	return auth, nil
 }
 
@@ -1124,6 +1268,11 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	}
 	targetAuth.UpdatedAt = time.Now()
 
+	isAntigravity := strings.EqualFold(strings.TrimSpace(targetAuth.Provider), "antigravity")
+	if isAntigravity && !*req.Disabled && targetAuth.PrimaryInfo != nil {
+		h.ensureSoleAntigravityPrimary(ctx, targetAuth)
+	}
+
 	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
 		return
@@ -1132,7 +1281,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
 }
 
-// PatchAuthFileFields updates editable fields (prefix, proxy_url, priority, note) of an auth file.
+// PatchAuthFileFields updates editable fields (prefix, proxy_url, headers, priority, note, billing_class) of an auth file.
 func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
@@ -1140,11 +1289,13 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	var req struct {
-		Name     string  `json:"name"`
-		Prefix   *string `json:"prefix"`
-		ProxyURL *string `json:"proxy_url"`
-		Priority *int    `json:"priority"`
-		Note     *string `json:"note"`
+		Name     string            `json:"name"`
+		Prefix   *string           `json:"prefix"`
+		ProxyURL *string           `json:"proxy_url"`
+		Headers  map[string]string `json:"headers"`
+		Priority *int              `json:"priority"`
+		Note     *string           `json:"note"`
+		BillingClass *string       `json:"billing_class"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -1180,14 +1331,108 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 
 	changed := false
 	if req.Prefix != nil {
-		targetAuth.Prefix = *req.Prefix
+		prefix := strings.TrimSpace(*req.Prefix)
+		targetAuth.Prefix = prefix
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		if prefix == "" {
+			delete(targetAuth.Metadata, "prefix")
+		} else {
+			targetAuth.Metadata["prefix"] = prefix
+		}
 		changed = true
 	}
 	if req.ProxyURL != nil {
-		targetAuth.ProxyURL = *req.ProxyURL
+		proxyURL := strings.TrimSpace(*req.ProxyURL)
+		targetAuth.ProxyURL = proxyURL
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		if proxyURL == "" {
+			delete(targetAuth.Metadata, "proxy_url")
+		} else {
+			targetAuth.Metadata["proxy_url"] = proxyURL
+		}
 		changed = true
 	}
-	if req.Priority != nil || req.Note != nil {
+	if len(req.Headers) > 0 {
+		existingHeaders := coreauth.ExtractCustomHeadersFromMetadata(targetAuth.Metadata)
+		nextHeaders := make(map[string]string, len(existingHeaders))
+		for k, v := range existingHeaders {
+			nextHeaders[k] = v
+		}
+		headerChanged := false
+
+		for key, value := range req.Headers {
+			name := strings.TrimSpace(key)
+			if name == "" {
+				continue
+			}
+			val := strings.TrimSpace(value)
+			attrKey := "header:" + name
+			if val == "" {
+				if _, ok := nextHeaders[name]; ok {
+					delete(nextHeaders, name)
+					headerChanged = true
+				}
+				if targetAuth.Attributes != nil {
+					if _, ok := targetAuth.Attributes[attrKey]; ok {
+						headerChanged = true
+					}
+				}
+				continue
+			}
+			if prev, ok := nextHeaders[name]; !ok || prev != val {
+				headerChanged = true
+			}
+			nextHeaders[name] = val
+			if targetAuth.Attributes != nil {
+				if prev, ok := targetAuth.Attributes[attrKey]; !ok || prev != val {
+					headerChanged = true
+				}
+			} else {
+				headerChanged = true
+			}
+		}
+
+		if headerChanged {
+			if targetAuth.Metadata == nil {
+				targetAuth.Metadata = make(map[string]any)
+			}
+			if targetAuth.Attributes == nil {
+				targetAuth.Attributes = make(map[string]string)
+			}
+
+			for key, value := range req.Headers {
+				name := strings.TrimSpace(key)
+				if name == "" {
+					continue
+				}
+				val := strings.TrimSpace(value)
+				attrKey := "header:" + name
+				if val == "" {
+					delete(nextHeaders, name)
+					delete(targetAuth.Attributes, attrKey)
+					continue
+				}
+				nextHeaders[name] = val
+				targetAuth.Attributes[attrKey] = val
+			}
+
+			if len(nextHeaders) == 0 {
+				delete(targetAuth.Metadata, "headers")
+			} else {
+				metaHeaders := make(map[string]any, len(nextHeaders))
+				for k, v := range nextHeaders {
+					metaHeaders[k] = v
+				}
+				targetAuth.Metadata["headers"] = metaHeaders
+			}
+			changed = true
+		}
+	}
+	if req.Priority != nil || req.Note != nil || req.BillingClass != nil {
 		if targetAuth.Metadata == nil {
 			targetAuth.Metadata = make(map[string]any)
 		}
@@ -1212,6 +1457,18 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			} else {
 				targetAuth.Metadata["note"] = trimmedNote
 				targetAuth.Attributes["note"] = trimmedNote
+			}
+		}
+		if req.BillingClass != nil {
+			normalizedBillingClass := normalizeBillingClassValue(*req.BillingClass)
+			if normalizedBillingClass == "" {
+				delete(targetAuth.Metadata, "billing_class")
+				delete(targetAuth.Metadata, "billing-class")
+				delete(targetAuth.Attributes, "billing_class")
+			} else {
+				targetAuth.Metadata["billing_class"] = normalizedBillingClass
+				delete(targetAuth.Metadata, "billing-class")
+				targetAuth.Attributes["billing_class"] = normalizedBillingClass
 			}
 		}
 		changed = true
@@ -1334,6 +1591,47 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 	}
 }
 
+func (h *Handler) ensureSoleAntigravityPrimary(ctx context.Context, primaryAuth *coreauth.Auth) {
+	if h.authManager == nil || primaryAuth == nil {
+		return
+	}
+	auths := h.authManager.List()
+	for _, auth := range auths {
+		if auth == nil || auth.ID == primaryAuth.ID {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+			continue
+		}
+		shouldDemote := false
+		if auth.PrimaryInfo != nil {
+			shouldDemote = auth.PrimaryInfo.IsPrimary
+		} else if !auth.Disabled && auth.Status != coreauth.StatusDisabled {
+			shouldDemote = true
+		}
+		if shouldDemote {
+			auth.Disabled = true
+			auth.Status = coreauth.StatusDisabled
+			auth.StatusMessage = "demoted via primary handoff"
+			if auth.PrimaryInfo == nil {
+				auth.PrimaryInfo = &coreauth.PrimaryInfo{}
+			}
+			auth.PrimaryInfo.IsPrimary = false
+			auth.UpdatedAt = time.Now()
+			_, _ = h.authManager.Update(ctx, auth)
+		}
+	}
+	primaryAuth.Disabled = false
+	primaryAuth.Status = coreauth.StatusActive
+	primaryAuth.StatusMessage = ""
+	primaryAuth.Unavailable = false
+	if primaryAuth.PrimaryInfo != nil {
+		primaryAuth.PrimaryInfo.IsPrimary = true
+	}
+	primaryAuth.UpdatedAt = time.Now()
+	_, _ = h.authManager.Update(ctx, primaryAuth)
+}
+
 func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {
 	if strings.TrimSpace(path) == "" {
 		return fmt.Errorf("auth path is empty")
@@ -1370,12 +1668,72 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	if store == nil {
 		return "", fmt.Errorf("token store unavailable")
 	}
+	h.initAntigravityPrimaryInfo(ctx, record)
 	if h.postAuthHook != nil {
 		if err := h.postAuthHook(ctx, record); err != nil {
 			return "", fmt.Errorf("post-auth hook failed: %w", err)
 		}
 	}
-	return store.Save(ctx, record)
+	savedPath, err := store.Save(ctx, record)
+	if err != nil {
+		return "", err
+	}
+	if err := h.upsertAuthRecord(ctx, record); err != nil {
+		cleanupErr := store.Delete(ctx, record.ID)
+		if cleanupErr != nil {
+			return "", fmt.Errorf("upsert failed: %w (cleanup also failed: %w)", err, cleanupErr)
+		}
+		return "", fmt.Errorf("upsert failed: %w (cleanup succeeded)", err)
+	}
+	return savedPath, nil
+}
+
+func (h *Handler) initAntigravityPrimaryInfo(ctx context.Context, record *coreauth.Auth) {
+	if h == nil || h.cfg == nil {
+		return
+	}
+	if record == nil || !strings.EqualFold(strings.TrimSpace(record.Provider), "antigravity") {
+		return
+	}
+	existingPrimary := false
+	maxOrder := 0
+	if h.authManager != nil {
+		for _, auth := range h.authManager.List() {
+			if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+				continue
+			}
+			if auth.ID == record.ID {
+				continue
+			}
+			if auth.PrimaryInfo != nil {
+				if auth.PrimaryInfo.Order > maxOrder {
+					maxOrder = auth.PrimaryInfo.Order
+				}
+				if auth.PrimaryInfo.IsPrimary {
+					existingPrimary = true
+				}
+				continue
+			}
+			if !auth.Disabled && auth.Status != coreauth.StatusDisabled {
+				existingPrimary = true
+			}
+		}
+	}
+	if existingPrimary {
+		record.PrimaryInfo = &coreauth.PrimaryInfo{
+			IsPrimary: false,
+			Order:     maxOrder + 1,
+		}
+		record.Disabled = true
+		record.Status = coreauth.StatusDisabled
+	} else {
+		record.PrimaryInfo = &coreauth.PrimaryInfo{
+			IsPrimary: true,
+			Order:     maxOrder + 1,
+		}
+		record.Disabled = false
+		record.Status = coreauth.StatusActive
+	}
 }
 
 func gitLabBaseURLFromRequest(c *gin.Context) string {

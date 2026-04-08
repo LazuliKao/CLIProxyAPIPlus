@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +31,8 @@ const providerAuthContextKey = "cliproxy.provider_auth"
 const GinProviderAuthKey = "providerAuth"
 const fallbackInfoContextKey = "cliproxy.fallback_info"
 const GinFallbackInfoKey = "fallbackInfo"
+const billingDecisionContextKey = "cliproxy.billing_decision"
+const GinBillingDecisionKey = "billingClassDecision"
 
 func SetProviderAuthInContext(ctx context.Context, provider, authID, authLabel string) context.Context {
 	authInfo := map[string]string{
@@ -77,6 +81,35 @@ func GetFallbackInfoFromContext(ctx context.Context) (requestedModel, actualMode
 	}
 	if v, ok := ctx.Value(fallbackInfoContextKey).(map[string]string); ok {
 		return v["requested_model"], v["actual_model"]
+	}
+	return "", ""
+}
+
+func SetBillingDecisionInContext(ctx context.Context, billingClass, reason string) context.Context {
+	decision := map[string]string{}
+	if normalized := normalizeRuntimeBillingClass(billingClass); normalized != "" {
+		decision["billing_class"] = normalized
+	}
+	if trimmedReason := strings.TrimSpace(reason); trimmedReason != "" {
+		decision["reason"] = trimmedReason
+	}
+	if len(decision) == 0 {
+		return ctx
+	}
+
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
+		ginCtx.Set(GinBillingDecisionKey, decision)
+	}
+
+	return context.WithValue(ctx, billingDecisionContextKey, decision)
+}
+
+func GetBillingDecisionFromContext(ctx context.Context) (billingClass, reason string) {
+	if ctx == nil {
+		return "", ""
+	}
+	if v, ok := ctx.Value(billingDecisionContextKey).(map[string]string); ok {
+		return v["billing_class"], v["reason"]
 	}
 	return "", ""
 }
@@ -487,8 +520,10 @@ func preserveRequestedModelSuffix(requestedModel, resolved string) string {
 }
 
 func (m *Manager) executionModelCandidates(auth *Auth, routeModel string) []string {
-	requestedModel := rewriteModelForAuth(routeModel, auth)
-	requestedModel = m.applyOAuthModelAlias(auth, requestedModel)
+	requestedModel := m.selectionModelForAuth(auth, routeModel)
+	if strings.TrimSpace(requestedModel) == "" {
+		requestedModel = rewriteModelForAuth(routeModel, auth)
+	}
 	if pool := m.resolveOpenAICompatUpstreamModelPool(auth, requestedModel); len(pool) > 0 {
 		if len(pool) == 1 {
 			return pool
@@ -503,6 +538,38 @@ func (m *Manager) executionModelCandidates(auth *Auth, routeModel string) []stri
 	return []string{resolved}
 }
 
+func (m *Manager) selectionModelForAuth(auth *Auth, routeModel string) string {
+	requestedModel := rewriteModelForAuth(routeModel, auth)
+	if strings.TrimSpace(requestedModel) == "" {
+		requestedModel = strings.TrimSpace(routeModel)
+	}
+	resolvedModel := m.applyOAuthModelAlias(auth, requestedModel)
+	if strings.TrimSpace(resolvedModel) == "" {
+		resolvedModel = requestedModel
+	}
+	if canonicalModelKey(resolvedModel) == canonicalModelKey(requestedModel) {
+		if blocked, _, _ := isAuthBlockedForModel(auth, requestedModel, time.Now()); blocked {
+			if fallback := m.resolveBlockedForkAliasTarget(auth, requestedModel); strings.TrimSpace(fallback) != "" {
+				resolvedModel = fallback
+			}
+		}
+	}
+	return resolvedModel
+}
+
+func (m *Manager) selectionModelKeyForAuth(auth *Auth, routeModel string) string {
+	return canonicalModelKey(m.selectionModelForAuth(auth, routeModel))
+}
+
+func (m *Manager) stateModelForExecution(auth *Auth, routeModel, upstreamModel string, pooled bool) string {
+	stateModel := executionResultModel(routeModel, upstreamModel, pooled)
+	selectionModel := m.selectionModelForAuth(auth, routeModel)
+	if canonicalModelKey(selectionModel) == canonicalModelKey(upstreamModel) && strings.TrimSpace(selectionModel) != "" {
+		return strings.TrimSpace(upstreamModel)
+	}
+	return stateModel
+}
+
 func executionResultModel(routeModel, upstreamModel string, pooled bool) string {
 	if pooled {
 		if resolved := strings.TrimSpace(upstreamModel); resolved != "" {
@@ -515,14 +582,14 @@ func executionResultModel(routeModel, upstreamModel string, pooled bool) string 
 	return strings.TrimSpace(upstreamModel)
 }
 
-func filterExecutionModels(auth *Auth, routeModel string, candidates []string, pooled bool) []string {
+func (m *Manager) filterExecutionModels(auth *Auth, routeModel string, candidates []string, pooled bool) []string {
 	if len(candidates) == 0 {
 		return nil
 	}
 	now := time.Now()
 	out := make([]string, 0, len(candidates))
 	for _, upstreamModel := range candidates {
-		stateModel := executionResultModel(routeModel, upstreamModel, pooled)
+		stateModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 		blocked, _, _ := isAuthBlockedForModel(auth, stateModel, now)
 		if blocked {
 			continue
@@ -535,12 +602,209 @@ func filterExecutionModels(auth *Auth, routeModel string, candidates []string, p
 func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string) ([]string, bool) {
 	candidates := m.executionModelCandidates(auth, routeModel)
 	pooled := len(candidates) > 1
-	return filterExecutionModels(auth, routeModel, candidates, pooled), pooled
+	return m.filterExecutionModels(auth, routeModel, candidates, pooled), pooled
 }
 
 func (m *Manager) prepareExecutionModels(auth *Auth, routeModel string) []string {
 	models, _ := m.preparedExecutionModels(auth, routeModel)
 	return models
+}
+
+func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeModel string, now time.Time) ([]*Auth, error) {
+	if len(auths) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
+	}
+
+	availableByPriority := make(map[int][]*Auth)
+	cooldownCount := 0
+	var earliest time.Time
+	for _, candidate := range auths {
+		if m.shouldExcludeAntigravityNonPrimary(provider, candidate) {
+			continue
+		}
+		checkModel := m.selectionModelForAuth(candidate, routeModel)
+		blocked, reason, next := isAuthBlockedForModel(candidate, checkModel, now)
+		if !blocked {
+			priority := authPriority(candidate)
+			availableByPriority[priority] = append(availableByPriority[priority], candidate)
+			continue
+		}
+		if reason == blockReasonCooldown {
+			cooldownCount++
+			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
+				earliest = next
+			}
+		}
+	}
+
+	if len(availableByPriority) == 0 {
+		if cooldownCount == len(auths) && !earliest.IsZero() {
+			providerForError := provider
+			if providerForError == "mixed" {
+				providerForError = ""
+			}
+			resetIn := earliest.Sub(now)
+			if resetIn < 0 {
+				resetIn = 0
+			}
+			return nil, newModelCooldownError(routeModel, providerForError, resetIn)
+		}
+		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+	}
+
+	bestPriority := 0
+	found := false
+	for priority := range availableByPriority {
+		if !found || priority > bestPriority {
+			bestPriority = priority
+			found = true
+		}
+	}
+
+	available := availableByPriority[bestPriority]
+	if len(available) > 1 {
+		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
+	}
+	return available, nil
+}
+
+func (m *Manager) shouldExcludeAntigravityNonPrimary(provider string, auth *Auth) bool {
+	if !strings.EqualFold(strings.TrimSpace(provider), "antigravity") {
+		return false
+	}
+	if auth == nil || auth.PrimaryInfo == nil {
+		return false
+	}
+	return !auth.PrimaryInfo.IsPrimary
+}
+
+func selectionArgForSelector(selector Selector, routeModel string) string {
+	if isBuiltInSelector(selector) {
+		return ""
+	}
+	return routeModel
+}
+
+func (m *Manager) authSupportsRouteModel(registryRef *registry.ModelRegistry, auth *Auth, routeModel string) bool {
+	if registryRef == nil || auth == nil {
+		return true
+	}
+	routeKey := canonicalModelKey(routeModel)
+	if routeKey == "" {
+		return true
+	}
+	if registryRef.ClientSupportsModel(auth.ID, routeKey) {
+		return true
+	}
+	selectionKey := m.selectionModelKeyForAuth(auth, routeModel)
+	if selectionKey != "" && selectionKey != routeKey && registryRef.ClientSupportsModel(auth.ID, selectionKey) {
+		return true
+	}
+	for _, aliasKey := range m.aliasRegistryModelKeysForAuth(auth, routeModel, routeKey, selectionKey) {
+		if aliasKey == "" || aliasKey == routeKey || aliasKey == selectionKey {
+			continue
+		}
+		if registryRef.ClientSupportsModel(auth.ID, aliasKey) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) aliasRegistryModelKeysForAuth(auth *Auth, routeModel, routeKey, selectionKey string) []string {
+	if m == nil || auth == nil {
+		return nil
+	}
+	kind, _ := auth.AccountInfo()
+	if !strings.EqualFold(strings.TrimSpace(kind), "api_key") {
+		return nil
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		return nil
+	}
+	keys := apiKeyRegistryAliasKeys(cfg, auth, routeKey, selectionKey)
+	if len(keys) > 0 {
+		return keys
+	}
+	rewritten := rewriteModelForAuth(routeModel, auth)
+	if strings.TrimSpace(rewritten) == "" {
+		rewritten = strings.TrimSpace(routeModel)
+	}
+	fallbackKey := canonicalModelKey(rewritten)
+	if fallbackKey == "" {
+		return nil
+	}
+	return []string{fallbackKey}
+}
+
+func apiKeyRegistryAliasKeys(cfg *internalconfig.Config, auth *Auth, targets ...string) []string {
+	if cfg == nil || auth == nil {
+		return nil
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	switch provider {
+	case "gemini":
+		if entry := resolveGeminiAPIKeyConfig(cfg, auth); entry != nil {
+			return configModelAliasKeysMatchingUpstream(entry.Models, targets...)
+		}
+	case "claude":
+		if entry := resolveClaudeAPIKeyConfig(cfg, auth); entry != nil {
+			return configModelAliasKeysMatchingUpstream(entry.Models, targets...)
+		}
+	case "codex":
+		if entry := resolveCodexAPIKeyConfig(cfg, auth); entry != nil {
+			return configModelAliasKeysMatchingUpstream(entry.Models, targets...)
+		}
+	case "vertex":
+		if entry := resolveVertexAPIKeyConfig(cfg, auth); entry != nil {
+			return configModelAliasKeysMatchingUpstream(entry.Models, targets...)
+		}
+	default:
+		if entry := resolveOpenAICompatConfig(cfg, strings.TrimSpace(auth.Attributes["provider_key"]), strings.TrimSpace(auth.Attributes["compat_name"]), auth.Provider); entry != nil {
+			return configModelAliasKeysMatchingUpstream(entry.Models, targets...)
+		}
+	}
+	return nil
+}
+
+func configModelAliasKeysMatchingUpstream[T interface {
+	GetName() string
+	GetAlias() string
+}](models []T, targets ...string) []string {
+	if len(models) == 0 || len(targets) == 0 {
+		return nil
+	}
+	targetSet := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		if key := canonicalModelKey(target); key != "" {
+			targetSet[key] = struct{}{}
+		}
+	}
+	if len(targetSet) == 0 {
+		return nil
+	}
+	keys := make([]string, 0)
+	seen := make(map[string]struct{})
+	for i := range models {
+		nameKey := canonicalModelKey(models[i].GetName())
+		if _, ok := targetSet[nameKey]; !ok {
+			continue
+		}
+		registryKey := canonicalModelKey(models[i].GetAlias())
+		if registryKey == "" {
+			registryKey = nameKey
+		}
+		if registryKey == "" {
+			continue
+		}
+		if _, ok := seen[registryKey]; ok {
+			continue
+		}
+		seen[registryKey] = struct{}{}
+		keys = append(keys, registryKey)
+	}
+	return keys
 }
 
 func discardStreamChunks(ch <-chan cliproxyexecutor.StreamChunk) {
@@ -693,7 +957,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	}
 	var lastErr error
 	for idx, execModel := range execModels {
-		resultModel := executionResultModel(routeModel, execModel, pooled)
+		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
 		execReq := req
 		execReq.Model = execModel
 		execCtx := ctx
@@ -1174,6 +1438,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 
 	var lastErr error
 	for attempt := 0; ; attempt++ {
+		normalized = m.filterProvidersForThreshold(req.Model, normalized, opts)
 		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
 		if errStream == nil {
 			return result, nil
@@ -1199,6 +1464,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	providers = m.filterProvidersForThreshold(routeModel, providers, opts)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	var lastErr error
@@ -1236,7 +1502,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		attempted[auth.ID] = struct{}{}
 		var authErr error
 		for _, upstreamModel := range models {
-			resultModel := executionResultModel(routeModel, upstreamModel, pooled)
+			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
 			attemptCtx := execCtx
@@ -1283,6 +1549,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	providers = m.filterProvidersForThreshold(routeModel, providers, opts)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	var lastErr error
@@ -1320,7 +1587,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		attempted[auth.ID] = struct{}{}
 		var authErr error
 		for _, upstreamModel := range models {
-			resultModel := executionResultModel(routeModel, upstreamModel, pooled)
+			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
 			attemptCtx := execCtx
@@ -1359,6 +1626,210 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 
 	}
+}
+
+func (m *Manager) filterProvidersForThreshold(routeModel string, providers []string, opts cliproxyexecutor.Options) []string {
+	if m == nil || len(providers) == 0 {
+		return providers
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil || len(cfg.Routing.TokenThresholdRules) == 0 {
+		return providers
+	}
+	count, ok := estimatedInputTokensFromMetadata(opts.Metadata)
+	if !ok || count <= 0 {
+		return providers
+	}
+	rule, ok := matchTokenThresholdRule(cfg.Routing.TokenThresholdRules, routeModel, count)
+	if !ok {
+		return providers
+	}
+	target := strings.TrimSpace(string(rule.BillingClass))
+	if target == "" {
+		return providers
+	}
+	matchedProviders := make([]string, 0, len(providers))
+	seen := make(map[string]struct{}, len(providers))
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, provider := range providers {
+		providerKey := strings.ToLower(strings.TrimSpace(provider))
+		if providerKey == "" {
+			continue
+		}
+		if _, done := seen[providerKey]; done {
+			continue
+		}
+		for _, auth := range m.auths {
+			if auth == nil || auth.Disabled || strings.ToLower(strings.TrimSpace(auth.Provider)) != providerKey {
+				continue
+			}
+			if strings.EqualFold(authBillingClass(auth), target) {
+				matchedProviders = append(matchedProviders, providerKey)
+				seen[providerKey] = struct{}{}
+				break
+			}
+		}
+	}
+	if len(matchedProviders) == 0 {
+		return providers
+	}
+	return matchedProviders
+}
+
+func estimatedInputTokensFromMetadata(meta map[string]any) (int, bool) {
+	if len(meta) == 0 {
+		return 0, false
+	}
+	v, ok := meta[cliproxyexecutor.EstimatedInputTokensMetadataKey]
+	if !ok || v == nil {
+		return 0, false
+	}
+	switch typed := v.(type) {
+	case int:
+		return typed, typed > 0
+	case int64:
+		return int(typed), typed > 0
+	case float64:
+		return int(typed), typed > 0
+	case json.Number:
+		parsed, err := typed.Int64()
+		return int(parsed), err == nil && parsed > 0
+	default:
+		return 0, false
+	}
+}
+
+func normalizeRuntimeBillingClass(value string) string {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	switch normalized {
+	case string(internalconfig.BillingClassMetered):
+		return string(internalconfig.BillingClassMetered)
+	case "per_request", string(internalconfig.BillingClassPerRequest):
+		return string(internalconfig.BillingClassPerRequest)
+	default:
+		return ""
+	}
+}
+
+func authBillingClass(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if normalized := normalizeRuntimeBillingClass(auth.Attributes["billing_class"]); normalized != "" {
+		return normalized
+	}
+	if normalized := normalizeRuntimeBillingClass(auth.Attributes["billing-class"]); normalized != "" {
+		return normalized
+	}
+	if raw, ok := auth.Metadata["billing_class"].(string); ok {
+		if normalized := normalizeRuntimeBillingClass(raw); normalized != "" {
+			return normalized
+		}
+	}
+	if raw, ok := auth.Metadata["billing-class"].(string); ok {
+		if normalized := normalizeRuntimeBillingClass(raw); normalized != "" {
+			return normalized
+		}
+	}
+	return ""
+}
+
+func thresholdRuleTargetBillingClass(rule internalconfig.TokenThresholdRule) string {
+	return normalizeRuntimeBillingClass(strings.TrimSpace(string(rule.BillingClass)))
+}
+
+func thresholdRuleReason(rule internalconfig.TokenThresholdRule, count int) string {
+	parts := []string{"threshold_rule"}
+	if pattern := strings.TrimSpace(rule.ModelPattern); pattern != "" {
+		parts = append(parts, fmt.Sprintf("pattern=%s", pattern))
+	}
+	if count > 0 {
+		parts = append(parts, fmt.Sprintf("estimated_tokens=%d", count))
+	}
+	if rule.MinTokens > 0 {
+		parts = append(parts, fmt.Sprintf("min_tokens=%d", rule.MinTokens))
+	}
+	if rule.MaxTokens > 0 {
+		parts = append(parts, fmt.Sprintf("max_tokens=%d", rule.MaxTokens))
+	}
+	if target := thresholdRuleTargetBillingClass(rule); target != "" {
+		parts = append(parts, fmt.Sprintf("target=%s", target))
+	}
+	return strings.Join(parts, " ")
+}
+
+func authDecisionLabel(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if label := strings.TrimSpace(auth.Label); label != "" {
+		return label
+	}
+	return strings.TrimSpace(auth.ID)
+}
+
+func (m *Manager) annotateThresholdDecisionSelected(ctx context.Context, routeModel string, opts cliproxyexecutor.Options, provider string, auth *Auth) context.Context {
+	rule, ok := m.thresholdRuleForRequest(routeModel, opts)
+	if !ok {
+		return ctx
+	}
+	count, _ := estimatedInputTokensFromMetadata(opts.Metadata)
+	reasonParts := []string{thresholdRuleReason(rule, count)}
+	if provider = strings.TrimSpace(provider); provider != "" {
+		reasonParts = append(reasonParts, fmt.Sprintf("provider=%s", provider))
+	}
+	if authName := authDecisionLabel(auth); authName != "" {
+		reasonParts = append(reasonParts, fmt.Sprintf("auth=%s", authName))
+	}
+	selectedClass := authBillingClass(auth)
+	if selectedClass != "" {
+		reasonParts = append(reasonParts, fmt.Sprintf("selected_billing_class=%s", selectedClass))
+	}
+	if selectedClass == "" {
+		selectedClass = thresholdRuleTargetBillingClass(rule)
+	}
+	return SetBillingDecisionInContext(ctx, selectedClass, strings.Join(reasonParts, " "))
+}
+
+func (m *Manager) annotateThresholdDecisionNoMatch(ctx context.Context, routeModel string, opts cliproxyexecutor.Options, suffix string) context.Context {
+	rule, ok := m.thresholdRuleForRequest(routeModel, opts)
+	if !ok {
+		return ctx
+	}
+	count, _ := estimatedInputTokensFromMetadata(opts.Metadata)
+	reason := thresholdRuleReason(rule, count)
+	if trimmedSuffix := strings.TrimSpace(suffix); trimmedSuffix != "" {
+		reason = reason + " " + trimmedSuffix
+	}
+	return SetBillingDecisionInContext(ctx, thresholdRuleTargetBillingClass(rule), reason)
+}
+
+func matchTokenThresholdRule(rules []internalconfig.TokenThresholdRule, routeModel string, count int) (internalconfig.TokenThresholdRule, bool) {
+	model := strings.TrimSpace(routeModel)
+	for _, rule := range rules {
+		if !rule.Enabled {
+			continue
+		}
+		if rule.MinTokens > 0 && count < rule.MinTokens {
+			continue
+		}
+		if rule.MaxTokens > 0 && count > rule.MaxTokens {
+			continue
+		}
+		if rule.MinTokens <= 0 && rule.MaxTokens <= 0 {
+			continue
+		}
+		pattern := strings.TrimSpace(rule.ModelPattern)
+		if pattern == "" {
+			return rule, true
+		}
+		matched, err := filepath.Match(pattern, model)
+		if err == nil && matched {
+			return rule, true
+		}
+	}
+	return internalconfig.TokenThresholdRule{}, false
 }
 
 func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int) (*cliproxyexecutor.StreamResult, error) {
@@ -1901,77 +2372,88 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		} else {
 			if result.Model != "" {
-				state := ensureModelState(auth, result.Model)
-				state.Unavailable = true
-				state.Status = StatusError
-				state.UpdatedAt = now
-				if result.Error != nil {
-					state.LastError = cloneError(result.Error)
-					state.StatusMessage = result.Error.Message
-					auth.LastError = cloneError(result.Error)
-					auth.StatusMessage = result.Error.Message
-				}
+				if !isRequestScopedNotFoundResultError(result.Error) {
+					state := ensureModelState(auth, result.Model)
+					state.Unavailable = true
+					state.Status = StatusError
+					state.UpdatedAt = now
+					if result.Error != nil {
+						state.LastError = cloneError(result.Error)
+						state.StatusMessage = result.Error.Message
+						auth.LastError = cloneError(result.Error)
+						auth.StatusMessage = result.Error.Message
+					}
 
-				statusCode := statusCodeFromResult(result.Error)
-				if isModelSupportResultError(result.Error) {
-					next := now.Add(12 * time.Hour)
-					state.NextRetryAfter = next
-					suspendReason = "model_not_supported"
-					shouldSuspendModel = true
-				} else {
-					switch statusCode {
-					case 401:
-						next := now.Add(30 * time.Minute)
-						state.NextRetryAfter = next
-						suspendReason = "unauthorized"
-						shouldSuspendModel = true
-					case 402, 403:
-						next := now.Add(30 * time.Minute)
-						state.NextRetryAfter = next
-						suspendReason = "payment_required"
-						shouldSuspendModel = true
-					case 404:
+					statusCode := statusCodeFromResult(result.Error)
+					if isModelSupportResultError(result.Error) {
 						next := now.Add(12 * time.Hour)
 						state.NextRetryAfter = next
-						suspendReason = "not_found"
+						suspendReason = "model_not_supported"
 						shouldSuspendModel = true
-					case 429:
-						var next time.Time
-						backoffLevel := state.Quota.BackoffLevel
-						if result.RetryAfter != nil {
-							next = now.Add(*result.RetryAfter)
-						} else {
-							cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
-							if cooldown > 0 {
-								next = now.Add(cooldown)
-							}
-							backoffLevel = nextLevel
-						}
-						state.NextRetryAfter = next
-						state.Quota = QuotaState{
-							Exceeded:      true,
-							Reason:        "quota",
-							NextRecoverAt: next,
-							BackoffLevel:  backoffLevel,
-						}
-						suspendReason = "quota"
-						shouldSuspendModel = true
-						setModelQuota = true
-					case 408, 500, 502, 503, 504:
-						if quotaCooldownDisabledForAuth(auth) {
-							state.NextRetryAfter = time.Time{}
-						} else {
-							next := now.Add(1 * time.Minute)
+					} else {
+						switch statusCode {
+						case 401:
+							next := now.Add(30 * time.Minute)
 							state.NextRetryAfter = next
+							suspendReason = "unauthorized"
+							shouldSuspendModel = true
+						case 402, 403:
+							next := now.Add(30 * time.Minute)
+							state.NextRetryAfter = next
+							suspendReason = "payment_required"
+							shouldSuspendModel = true
+						case 404:
+							next := now.Add(12 * time.Hour)
+							state.NextRetryAfter = next
+							suspendReason = "not_found"
+							shouldSuspendModel = true
+						case 429:
+							var next time.Time
+							backoffLevel := state.Quota.BackoffLevel
+							if result.RetryAfter != nil {
+								next = now.Add(*result.RetryAfter)
+							} else {
+								cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
+								if cooldown > 0 {
+									next = now.Add(cooldown)
+								}
+								backoffLevel = nextLevel
+							}
+							state.NextRetryAfter = next
+							state.Quota = QuotaState{
+								Exceeded:      true,
+								Reason:        "quota",
+								NextRecoverAt: next,
+								BackoffLevel:  backoffLevel,
+							}
+							suspendReason = "quota"
+							shouldSuspendModel = true
+							setModelQuota = true
+						case 408, 500, 502, 503, 504:
+							if quotaCooldownDisabledForAuth(auth) {
+								state.NextRetryAfter = time.Time{}
+							} else {
+								next := now.Add(1 * time.Minute)
+								state.NextRetryAfter = next
+							}
+						default:
+							state.NextRetryAfter = time.Time{}
 						}
-					default:
-						state.NextRetryAfter = time.Time{}
+					}
+
+					auth.Status = StatusError
+					auth.UpdatedAt = now
+					updateAggregatedAvailability(auth, now)
+
+					if isAntigravityHandoffError(statusCode) &&
+						strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") &&
+						auth.PrimaryInfo != nil && auth.PrimaryInfo.IsPrimary {
+						cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+						if cfg != nil && cfg.AntigravityPrimaryHandoff {
+							m.promoteNextAntigravityPrimary(ctx, auth.ID)
+						}
 					}
 				}
-
-				auth.Status = StatusError
-				auth.UpdatedAt = now
-				updateAggregatedAvailability(auth, now)
 			} else {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
 			}
@@ -2177,6 +2659,71 @@ func statusCodeFromResult(err *Error) int {
 	return err.StatusCode()
 }
 
+// isAntigravityHandoffError returns true if the error status code should trigger
+// a primary credential handoff for Antigravity provider.
+func isAntigravityHandoffError(statusCode int) bool {
+	switch statusCode {
+	case 401, 403, 429, 502, 503, 504:
+		return true
+	default:
+		return false
+	}
+}
+
+// promoteNextAntigravityPrimary disables the current primary Antigravity credential
+// and promotes the next one in order (wrap-around to first if all exhausted).
+// Must be called with m.mu held.
+func (m *Manager) promoteNextAntigravityPrimary(ctx context.Context, currentAuthID string) {
+	var allAntigravity []*Auth
+	for _, auth := range m.auths {
+		if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") && auth.PrimaryInfo != nil {
+			allAntigravity = append(allAntigravity, auth)
+		}
+	}
+	if len(allAntigravity) == 0 {
+		return
+	}
+
+	sort.Slice(allAntigravity, func(i, j int) bool {
+		return allAntigravity[i].PrimaryInfo.Order < allAntigravity[j].PrimaryInfo.Order
+	})
+
+	currentIdx := -1
+	for i, auth := range allAntigravity {
+		if auth.ID == currentAuthID {
+			currentIdx = i
+			break
+		}
+	}
+	if currentIdx < 0 {
+		return
+	}
+
+	current := allAntigravity[currentIdx]
+	current.Disabled = true
+	current.Status = StatusDisabled
+	current.PrimaryInfo.IsPrimary = false
+	current.UpdatedAt = time.Now()
+	_ = m.persist(ctx, current)
+
+	nextIdx := (currentIdx + 1) % len(allAntigravity)
+	next := allAntigravity[nextIdx]
+	next.Disabled = false
+	next.Status = StatusActive
+	next.StatusMessage = ""
+	next.Unavailable = false
+	next.PrimaryInfo.IsPrimary = true
+	next.UpdatedAt = time.Now()
+	_ = m.persist(ctx, next)
+
+	log.WithFields(log.Fields{
+		"old_primary": current.ID,
+		"new_primary": next.ID,
+		"old_order":   current.PrimaryInfo.Order,
+		"new_order":   next.PrimaryInfo.Order,
+	}).Info("antigravity primary handoff: promoted next credential")
+}
+
 func isModelSupportErrorMessage(message string) bool {
 	lower := strings.ToLower(strings.TrimSpace(message))
 	if lower == "" {
@@ -2224,11 +2771,29 @@ func isModelSupportResultError(err *Error) bool {
 	return isModelSupportErrorMessage(err.Message)
 }
 
+func isRequestScopedNotFoundMessage(message string) bool {
+	if message == "" {
+		return false
+	}
+	lower := strings.ToLower(message)
+	return strings.Contains(lower, "item with id") &&
+		strings.Contains(lower, "not found") &&
+		strings.Contains(lower, "items are not persisted when `store` is set to false")
+}
+
+func isRequestScopedNotFoundResultError(err *Error) bool {
+	if err == nil || statusCodeFromResult(err) != http.StatusNotFound {
+		return false
+	}
+	return isRequestScopedNotFoundMessage(err.Message)
+}
+
 // isRequestInvalidError returns true if the error represents a client request
 // error that should not be retried. Specifically, it treats 400 responses with
-// "invalid_request_error" and all 422 responses as request-shape failures,
-// where switching auths or pooled upstream models will not help. Model-support
-// errors are excluded so routing can fall through to another auth or upstream.
+// "invalid_request_error", request-scoped 404 item misses caused by `store=false`,
+// and all 422 responses as request-shape failures, where switching auths or
+// pooled upstream models will not help. Model-support errors are excluded so
+// routing can fall through to another auth or upstream.
 func isRequestInvalidError(err error) bool {
 	if err == nil {
 		return false
@@ -2240,6 +2805,8 @@ func isRequestInvalidError(err error) bool {
 	switch status {
 	case http.StatusBadRequest:
 		return strings.Contains(err.Error(), "invalid_request_error")
+	case http.StatusNotFound:
+		return isRequestScopedNotFoundMessage(err.Error())
 	case http.StatusUnprocessableEntity:
 		return true
 	default:
@@ -2249,6 +2816,9 @@ func isRequestInvalidError(err error) bool {
 
 func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time) {
 	if auth == nil {
+		return
+	}
+	if isRequestScopedNotFoundResultError(resultErr) {
 		return
 	}
 	auth.Unavailable = true
@@ -2414,6 +2984,44 @@ func shouldRetrySchedulerPick(err error) bool {
 	return authErr.Code == "auth_not_found" || authErr.Code == "auth_unavailable"
 }
 
+func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) bool {
+	if auth == nil || strings.TrimSpace(routeModel) == "" {
+		return false
+	}
+	return m.selectionModelKeyForAuth(auth, routeModel) != canonicalModelKey(routeModel)
+}
+
+func (m *Manager) thresholdRoutingRequired(routeModel string, opts cliproxyexecutor.Options) bool {
+	_, ok := m.thresholdRuleForRequest(routeModel, opts)
+	return ok
+}
+
+func (m *Manager) thresholdRuleForRequest(routeModel string, opts cliproxyexecutor.Options) (internalconfig.TokenThresholdRule, bool) {
+	if m == nil {
+		return internalconfig.TokenThresholdRule{}, false
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil || len(cfg.Routing.TokenThresholdRules) == 0 {
+		return internalconfig.TokenThresholdRule{}, false
+	}
+	count, ok := estimatedInputTokensFromMetadata(opts.Metadata)
+	if !ok || count <= 0 {
+		return internalconfig.TokenThresholdRule{}, false
+	}
+	return matchTokenThresholdRule(cfg.Routing.TokenThresholdRules, routeModel, count)
+}
+
+func (m *Manager) authMatchesThresholdRule(auth *Auth, routeModel string, opts cliproxyexecutor.Options) bool {
+	rule, ok := m.thresholdRuleForRequest(routeModel, opts)
+	if !ok {
+		return true
+	}
+	if auth == nil {
+		return false
+	}
+	return strings.EqualFold(authBillingClass(auth), strings.TrimSpace(string(rule.BillingClass)))
+}
+
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 
@@ -2437,22 +3045,31 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if candidate.Provider != provider || candidate.Disabled {
 			continue
 		}
+		if !m.authMatchesThresholdRule(candidate, model, opts) {
+			continue
+		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
 		if _, used := tried[candidate.ID]; used {
 			continue
 		}
-		if modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(candidate.ID, modelKey) {
+		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
+		m.annotateThresholdDecisionNoMatch(ctx, model, opts, "result=no_matching_auth_for_billing_class")
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	selected, errPick := m.selector.Pick(ctx, provider, model, opts, candidates)
+	available, errAvailable := m.availableAuthsForRouteModel(candidates, provider, model, time.Now())
+	if errAvailable != nil {
+		m.mu.RUnlock()
+		return nil, nil, errAvailable
+	}
+	selected, errPick := m.selector.Pick(ctx, provider, selectionArgForSelector(m.selector, model), opts, available)
 	if errPick != nil {
 		m.mu.RUnlock()
 		return nil, nil, errPick
@@ -2461,6 +3078,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
+	m.annotateThresholdDecisionSelected(ctx, model, opts, provider, selected)
 	authCopy := selected.Clone()
 	m.mu.RUnlock()
 	if !selected.indexAssigned {
@@ -2477,6 +3095,25 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if !m.useSchedulerFastPath() {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
+	}
+	if m.thresholdRoutingRequired(model, opts) {
+		return m.pickNextLegacy(ctx, provider, model, opts, tried)
+	}
+	if strings.TrimSpace(model) != "" {
+		m.mu.RLock()
+		for _, candidate := range m.auths {
+			if candidate == nil || candidate.Provider != provider || candidate.Disabled {
+				continue
+			}
+			if _, used := tried[candidate.ID]; used {
+				continue
+			}
+			if m.routeAwareSelectionRequired(candidate, model) {
+				m.mu.RUnlock()
+				return m.pickNextLegacy(ctx, provider, model, opts, tried)
+			}
+		}
+		m.mu.RUnlock()
 	}
 	executor, okExecutor := m.Executor(provider)
 	if !okExecutor {
@@ -2535,6 +3172,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if candidate == nil || candidate.Disabled {
 			continue
 		}
+		if !m.authMatchesThresholdRule(candidate, model, opts) {
+			continue
+		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
@@ -2551,16 +3191,22 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if _, ok := m.executors[providerKey]; !ok {
 			continue
 		}
-		if modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(candidate.ID, modelKey) {
+		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
+		m.annotateThresholdDecisionNoMatch(ctx, model, opts, "result=no_matching_auth_for_billing_class")
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	selected, errPick := m.selector.Pick(ctx, "mixed", model, opts, candidates)
+	available, errAvailable := m.availableAuthsForRouteModel(candidates, "mixed", model, time.Now())
+	if errAvailable != nil {
+		m.mu.RUnlock()
+		return nil, nil, "", errAvailable
+	}
+	selected, errPick := m.selector.Pick(ctx, "mixed", selectionArgForSelector(m.selector, model), opts, available)
 	if errPick != nil {
 		m.mu.RUnlock()
 		return nil, nil, "", errPick
@@ -2570,6 +3216,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
 	providerKey := strings.TrimSpace(strings.ToLower(selected.Provider))
+	m.annotateThresholdDecisionSelected(ctx, model, opts, providerKey, selected)
 	executor, okExecutor := m.executors[providerKey]
 	if !okExecutor {
 		m.mu.RUnlock()
@@ -2592,6 +3239,9 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	if !m.useSchedulerFastPath() {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
+	if m.thresholdRoutingRequired(model, opts) {
+		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+	}
 
 	eligibleProviders := make([]string, 0, len(providers))
 	seenProviders := make(map[string]struct{}, len(providers))
@@ -2611,6 +3261,29 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	}
 	if len(eligibleProviders) == 0 {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	if strings.TrimSpace(model) != "" {
+		providerSet := make(map[string]struct{}, len(eligibleProviders))
+		for _, providerKey := range eligibleProviders {
+			providerSet[providerKey] = struct{}{}
+		}
+		m.mu.RLock()
+		for _, candidate := range m.auths {
+			if candidate == nil || candidate.Disabled {
+				continue
+			}
+			if _, ok := providerSet[strings.TrimSpace(strings.ToLower(candidate.Provider))]; !ok {
+				continue
+			}
+			if _, used := tried[candidate.ID]; used {
+				continue
+			}
+			if m.routeAwareSelectionRequired(candidate, model) {
+				m.mu.RUnlock()
+				return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+			}
+		}
+		m.mu.RUnlock()
 	}
 
 	selected, providerKey, errPick := m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)

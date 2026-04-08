@@ -16,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -36,6 +37,8 @@ const providerAuthContextKey = "cliproxy.provider_auth"
 const ginProviderAuthKey = "providerAuth"
 const fallbackInfoContextKey = "cliproxy.fallback_info"
 const ginFallbackInfoKey = "fallbackInfo"
+const billingDecisionContextKey = "cliproxy.billing_decision"
+const ginBillingDecisionKey = "billingClassDecision"
 
 func getProviderAuthFromContext(c *gin.Context) (provider, authID, authLabel string) {
 	if c == nil {
@@ -83,6 +86,46 @@ func getFallbackInfoFromContext(c *gin.Context) (requestedModel, actualModel str
 	}
 	if v, ok := ctx.Value(fallbackInfoContextKey).(map[string]string); ok {
 		return v["requested_model"], v["actual_model"]
+	}
+	return "", ""
+}
+
+func getUsageDetailFromContext(c *gin.Context) *usage.Detail {
+	if c == nil {
+		return nil
+	}
+
+	if v, exists := c.Get("usageDetail"); exists {
+		if detail, ok := v.(*usage.Detail); ok {
+			return detail
+		}
+		if detail, ok := v.(usage.Detail); ok {
+			return &detail
+		}
+	}
+	return nil
+}
+
+func getBillingDecisionFromContext(c *gin.Context) (billingClass, reason string) {
+	if c == nil {
+		return "", ""
+	}
+
+	if v, exists := c.Get(ginBillingDecisionKey); exists {
+		if info, ok := v.(map[string]string); ok {
+			return info["billing_class"], info["reason"]
+		}
+	}
+
+	if c.Request == nil {
+		return "", ""
+	}
+	ctx := c.Request.Context()
+	if ctx == nil {
+		return "", ""
+	}
+	if v, ok := ctx.Value(billingDecisionContextKey).(map[string]string); ok {
+		return v["billing_class"], v["reason"]
 	}
 	return "", ""
 }
@@ -163,6 +206,7 @@ func GinLogrusLogger() gin.HandlerFunc {
 
 		provider, authID, authLabel := getProviderAuthFromContext(c)
 		requestedModel, actualModel := getFallbackInfoFromContext(c)
+		billingClass, billingReason := getBillingDecisionFromContext(c)
 		providerInfo := ""
 		if provider != "" {
 			displayAuth := authLabel
@@ -198,6 +242,31 @@ func GinLogrusLogger() gin.HandlerFunc {
 				logLine = logLine + " | " + providerInfo
 			} else if authKeyName != "" {
 				logLine = logLine + " | " + authKeyName
+			}
+		}
+
+		if isAIAPIPath(path) && (billingClass != "" || billingReason != "") {
+			billingSegment := ""
+			if billingClass != "" {
+				billingSegment = fmt.Sprintf("billing class=%s", billingClass)
+			}
+			if billingReason != "" {
+				if billingSegment != "" {
+					billingSegment = billingSegment + " "
+				}
+				billingSegment = billingSegment + fmt.Sprintf("reason=%s", billingReason)
+			}
+			if billingSegment != "" {
+				logLine = logLine + " | " + billingSegment
+			}
+		}
+
+		// Append token usage if available
+		if isAIAPIPath(path) {
+			detail := getUsageDetailFromContext(c)
+			if detail != nil && (detail.InputTokens > 0 || detail.OutputTokens > 0) {
+				tokenSegment := fmt.Sprintf("tokens in=%d out=%d", detail.InputTokens, detail.OutputTokens)
+				logLine = logLine + " | " + tokenSegment
 			}
 		}
 

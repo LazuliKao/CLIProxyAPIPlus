@@ -69,10 +69,14 @@ func TestFileSynthesizer_Synthesize_ValidAuthFile(t *testing.T) {
 
 	// Create a valid auth file
 	authData := map[string]any{
-		"type":            "claude",
-		"email":           "test@example.com",
-		"proxy_url":       "http://proxy.local",
-		"prefix":          "test-prefix",
+		"type":      "claude",
+		"email":     "test@example.com",
+		"proxy_url": "http://proxy.local",
+		"prefix":    "test-prefix",
+		"headers": map[string]string{
+			" X-Test ": " value ",
+			"X-Empty":  "  ",
+		},
 		"disable_cooling": true,
 		"request_retry":   2,
 	}
@@ -109,6 +113,12 @@ func TestFileSynthesizer_Synthesize_ValidAuthFile(t *testing.T) {
 	}
 	if auths[0].ProxyURL != "http://proxy.local" {
 		t.Errorf("expected proxy_url http://proxy.local, got %s", auths[0].ProxyURL)
+	}
+	if got := auths[0].Attributes["header:X-Test"]; got != "value" {
+		t.Errorf("expected header:X-Test value, got %q", got)
+	}
+	if _, ok := auths[0].Attributes["header:X-Empty"]; ok {
+		t.Errorf("expected header:X-Empty to be absent, got %q", auths[0].Attributes["header:X-Empty"])
 	}
 	if v, ok := auths[0].Metadata["disable_cooling"].(bool); !ok || !v {
 		t.Errorf("expected disable_cooling true, got %v", auths[0].Metadata["disable_cooling"])
@@ -369,6 +379,88 @@ func TestFileSynthesizer_Synthesize_PriorityParsing(t *testing.T) {
 	}
 }
 
+func TestFileSynthesizer_Synthesize_BillingClassParsing(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    any
+		want     string
+		hasValue bool
+	}{
+		{name: "metered", value: "metered", want: "metered", hasValue: true},
+		{name: "per_request alias", value: "per_request", want: "per-request", hasValue: true},
+		{name: "invalid", value: "foo", hasValue: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			authData := map[string]any{"type": "claude", "billing_class": tt.value}
+			data, _ := json.Marshal(authData)
+			if err := os.WriteFile(filepath.Join(tempDir, "auth.json"), data, 0644); err != nil {
+				t.Fatalf("failed to write auth file: %v", err)
+			}
+			synth := NewFileSynthesizer()
+			ctx := &SynthesisContext{Config: &config.Config{}, AuthDir: tempDir, Now: time.Now(), IDGenerator: NewStableIDGenerator()}
+			auths, err := synth.Synthesize(ctx)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(auths) != 1 {
+				t.Fatalf("expected 1 auth, got %d", len(auths))
+			}
+			value, ok := auths[0].Attributes["billing_class"]
+			if tt.hasValue {
+				if !ok {
+					t.Fatal("expected billing_class attribute to be set")
+				}
+				if value != tt.want {
+					t.Fatalf("expected billing_class %q, got %q", tt.want, value)
+				}
+			} else if ok {
+				t.Fatalf("expected billing_class attribute to be absent, got %q", value)
+			}
+		})
+	}
+}
+
+func TestFileSynthesizer_Synthesize_AntigravityPrimaryInfo(t *testing.T) {
+	tempDir := t.TempDir()
+	authData := map[string]any{
+		"type":     "antigravity",
+		"disabled": true,
+		"primary_info": map[string]any{
+			"is_primary": false,
+			"order":      2,
+		},
+	}
+	data, _ := json.Marshal(authData)
+	if err := os.WriteFile(filepath.Join(tempDir, "antigravity.json"), data, 0644); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{Config: &config.Config{}, AuthDir: tempDir, Now: time.Now(), IDGenerator: NewStableIDGenerator()}
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	if auths[0].PrimaryInfo == nil {
+		t.Fatal("expected primary info to be restored")
+	}
+	if auths[0].PrimaryInfo.IsPrimary {
+		t.Fatal("expected antigravity auth to remain standby")
+	}
+	if auths[0].PrimaryInfo.Order != 2 {
+		t.Fatalf("expected order 2, got %d", auths[0].PrimaryInfo.Order)
+	}
+	if !auths[0].Disabled {
+		t.Fatal("expected disabled standby auth to remain disabled")
+	}
+}
+
 func TestFileSynthesizer_Synthesize_OAuthExcludedModelsMerged(t *testing.T) {
 	tempDir := t.TempDir()
 	authData := map[string]any{
@@ -450,8 +542,9 @@ func TestSynthesizeGeminiVirtualAuths_MultiProject(t *testing.T) {
 		Prefix:   "test-prefix",
 		ProxyURL: "http://proxy.local",
 		Attributes: map[string]string{
-			"source": "test-source",
-			"path":   "/path/to/auth",
+			"source":       "test-source",
+			"path":         "/path/to/auth",
+			"header:X-Tra": "value",
 		},
 	}
 	metadata := map[string]any{
@@ -505,6 +598,9 @@ func TestSynthesizeGeminiVirtualAuths_MultiProject(t *testing.T) {
 		}
 		if v.Attributes["runtime_only"] != "true" {
 			t.Error("expected runtime_only=true")
+		}
+		if got := v.Attributes["header:X-Tra"]; got != "value" {
+			t.Errorf("expected virtual %d header:X-Tra %q, got %q", i, "value", got)
 		}
 		if v.Attributes["gemini_virtual_parent"] != "primary-id" {
 			t.Errorf("expected gemini_virtual_parent=primary-id, got %s", v.Attributes["gemini_virtual_parent"])
@@ -776,6 +872,30 @@ func TestSynthesizeGeminiVirtualAuths_NotePropagated(t *testing.T) {
 		}
 		if got := v.Attributes["priority"]; got != "5" {
 			t.Errorf("virtual %d: expected priority %q, got %q", i, "5", got)
+		}
+	}
+}
+
+func TestSynthesizeGeminiVirtualAuths_BillingClassPropagated(t *testing.T) {
+	now := time.Now()
+	primary := &coreauth.Auth{
+		ID:       "primary-id",
+		Provider: "gemini-cli",
+		Label:    "test@example.com",
+		Attributes: map[string]string{
+			"source":        "test-source",
+			"path":          "/path/to/auth",
+			"billing_class": "metered",
+		},
+	}
+	metadata := map[string]any{"project_id": "proj-a, proj-b", "email": "test@example.com", "type": "gemini"}
+	virtuals := SynthesizeGeminiVirtualAuths(primary, metadata, now)
+	if len(virtuals) != 2 {
+		t.Fatalf("expected 2 virtuals, got %d", len(virtuals))
+	}
+	for i, v := range virtuals {
+		if got := v.Attributes["billing_class"]; got != "metered" {
+			t.Errorf("virtual %d: expected billing_class %q, got %q", i, "metered", got)
 		}
 	}
 }

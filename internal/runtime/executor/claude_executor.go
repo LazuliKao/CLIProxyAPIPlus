@@ -22,6 +22,8 @@ import (
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -43,6 +45,12 @@ type ClaudeExecutor struct {
 // claudeToolPrefix is empty to match real Claude Code behavior (no tool name prefix).
 // Previously "proxy_" was used but this is a detectable fingerprint difference.
 const claudeToolPrefix = ""
+
+const defaultClaudeMaxTokens = 32000
+
+// Anthropic-compatible upstreams may reject or even crash when Claude models
+// omit max_tokens. Prefer registered model metadata before using a fallback.
+const defaultModelMaxTokens = 1024
 
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }
 
@@ -127,9 +135,12 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	body = ensureModelMaxTokens(body, baseModel)
 
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
+	body = ensureClaudeMaxTokens(body, baseModel)
+	body = normalizeClaudeTemperatureForThinking(body)
 
 	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
 	if countCacheControls(body) == 0 {
@@ -152,6 +163,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	bodyForUpstream := body
 	if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
 		bodyForUpstream = applyClaudeToolPrefix(body, claudeToolPrefix)
+	}
+	if experimentalCCHSigningEnabled(e.cfg, auth) {
+		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
 	}
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
@@ -178,15 +192,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		AuthValue: authValue,
 	})
 
-	log.WithFields(log.Fields{
-		"auth_id":  authID,
-		"provider": e.Identifier(),
-		"model":    baseModel,
-		"url":      url,
-		"method":   http.MethodPost,
-	}).Infof("external HTTP request: POST %s", url)
-
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := helps.NewUtlsHTTPClient(e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
@@ -301,9 +307,12 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	body = ensureModelMaxTokens(body, baseModel)
 
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
+	body = ensureClaudeMaxTokens(body, baseModel)
+	body = normalizeClaudeTemperatureForThinking(body)
 
 	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
 	if countCacheControls(body) == 0 {
@@ -323,6 +332,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	bodyForUpstream := body
 	if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
 		bodyForUpstream = applyClaudeToolPrefix(body, claudeToolPrefix)
+	}
+	if experimentalCCHSigningEnabled(e.cfg, auth) {
+		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
 	}
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
@@ -645,6 +657,61 @@ func disableThinkingIfToolChoiceForced(body []byte) []byte {
 	return body
 }
 
+func ensureClaudeMaxTokens(body []byte, model string) []byte {
+	if maxTokens := gjson.GetBytes(body, "max_tokens"); maxTokens.Exists() && maxTokens.Int() > 0 {
+		return body
+	}
+
+	maxTokens := defaultClaudeMaxTokens
+	if modelInfo := registry.LookupModelInfo(model, "claude"); modelInfo != nil && modelInfo.MaxCompletionTokens > 0 {
+		maxTokens = modelInfo.MaxCompletionTokens
+	}
+
+	body, _ = sjson.SetBytes(body, "max_tokens", maxTokens)
+	return body
+}
+
+func ensureModelMaxTokens(body []byte, modelID string) []byte {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body
+	}
+
+	if maxTokens := gjson.GetBytes(body, "max_tokens"); maxTokens.Exists() {
+		return body
+	}
+
+	for _, provider := range registry.GetGlobalRegistry().GetModelProviders(strings.TrimSpace(modelID)) {
+		if strings.EqualFold(provider, "claude") {
+			maxTokens := defaultModelMaxTokens
+			if info := registry.GetGlobalRegistry().GetModelInfo(strings.TrimSpace(modelID), "claude"); info != nil && info.MaxCompletionTokens > 0 {
+				maxTokens = info.MaxCompletionTokens
+			}
+			body, _ = sjson.SetBytes(body, "max_tokens", maxTokens)
+			return body
+		}
+	}
+	return body
+}
+
+// normalizeClaudeTemperatureForThinking keeps Anthropic message requests valid when
+// thinking is enabled. Anthropic rejects temperatures other than 1 when
+// thinking.type is enabled/adaptive/auto.
+func normalizeClaudeTemperatureForThinking(body []byte) []byte {
+	if !gjson.GetBytes(body, "temperature").Exists() {
+		return body
+	}
+
+	thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String()))
+	switch thinkingType {
+	case "enabled", "adaptive", "auto":
+		if temp := gjson.GetBytes(body, "temperature"); temp.Exists() && temp.Type == gjson.Number && temp.Float() == 1 {
+			return body
+		}
+		body, _ = sjson.SetBytes(body, "temperature", 1)
+	}
+	return body
+}
+
 type compositeReadCloser struct {
 	io.Reader
 	closers []func() error
@@ -821,6 +888,14 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 			hasClaude1MHeader = true
 		}
 	}
+	// Also check auth attributes — GitLab Duo sets gitlab_duo_force_context_1m
+	// when routing through the Anthropic gateway, but the gin headers won't have
+	// X-CPA-CLAUDE-1M because the request is internally constructed.
+	if !hasClaude1MHeader && auth != nil && auth.Attributes != nil {
+		if strings.EqualFold(strings.TrimSpace(auth.Attributes["gitlab_duo_force_context_1m"]), "true") {
+			hasClaude1MHeader = true
+		}
+	}
 
 	// Merge extra betas from request body and request flags.
 	if len(extraBetas) > 0 || hasClaude1MHeader {
@@ -870,12 +945,12 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	if auth != nil {
 		attrs = auth.Attributes
 	}
-	util.ApplyCustomHeadersFromAttrs(r, attrs)
 	if stabilizeDeviceProfile {
 		applyClaudeDeviceProfileHeaders(r, deviceProfile)
 	} else {
 		applyClaudeLegacyDeviceHeaders(r, ginHeaders, cfg)
 	}
+	util.ApplyCustomHeadersFromAttrs(r, attrs)
 	// Re-enforce Accept-Encoding: identity after ApplyCustomHeadersFromAttrs, which
 	// may override it with a user-configured value.  Compressed SSE breaks the line
 	// scanner regardless of user preference, so this is non-negotiable for streams.
@@ -1121,35 +1196,6 @@ func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (string, bool, []string, bo
 	cacheUserID := strings.EqualFold(strings.TrimSpace(auth.Attributes["cloak_cache_user_id"]), "true")
 
 	return cloakMode, strictMode, sensitiveWords, cacheUserID
-}
-
-// resolveClaudeKeyCloakConfig finds the matching ClaudeKey config and returns its CloakConfig.
-func resolveClaudeKeyCloakConfig(cfg *config.Config, auth *cliproxyauth.Auth) *config.CloakConfig {
-	if cfg == nil || auth == nil {
-		return nil
-	}
-
-	apiKey, baseURL := claudeCreds(auth)
-	if apiKey == "" {
-		return nil
-	}
-
-	for i := range cfg.ClaudeKey {
-		entry := &cfg.ClaudeKey[i]
-		cfgKey := strings.TrimSpace(entry.APIKey)
-		cfgBase := strings.TrimSpace(entry.BaseURL)
-
-		// Match by API key
-		if strings.EqualFold(cfgKey, apiKey) {
-			// If baseURL is specified, also check it
-			if baseURL != "" && cfgBase != "" && !strings.EqualFold(cfgBase, baseURL) {
-				continue
-			}
-			return entry.Cloak
-		}
-	}
-
-	return nil
 }
 
 // injectFakeUserID generates and injects a fake user ID into the request metadata.

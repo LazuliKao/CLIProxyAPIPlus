@@ -138,6 +138,11 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+	if provider == "antigravity" {
+		if primaryInfo := extractPrimaryInfo(metadata); primaryInfo != nil {
+			a.PrimaryInfo = primaryInfo
+		}
+	}
 	// Read priority from auth file.
 	if rawPriority, ok := metadata["priority"]; ok {
 		switch v := rawPriority.(type) {
@@ -158,6 +163,21 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			}
 		}
 	}
+	// Read billing class from auth file.
+	if rawBillingClass, ok := metadata["billing_class"]; ok {
+		if billingClass, isStr := rawBillingClass.(string); isStr {
+			if normalized := normalizeFileBillingClass(billingClass); normalized != "" {
+				a.Attributes["billing_class"] = normalized
+			}
+		}
+	} else if rawBillingClass, ok := metadata["billing-class"]; ok {
+		if billingClass, isStr := rawBillingClass.(string); isStr {
+			if normalized := normalizeFileBillingClass(billingClass); normalized != "" {
+				a.Attributes["billing_class"] = normalized
+			}
+		}
+	}
+	coreauth.ApplyCustomHeadersFromMetadata(a)
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
 	// For codex auth files, extract plan_type from the JWT id_token.
 	if provider == "codex" {
@@ -181,6 +201,32 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		}
 	}
 	return []*coreauth.Auth{a}
+}
+
+func extractPrimaryInfo(metadata map[string]any) *coreauth.PrimaryInfo {
+	if metadata == nil {
+		return nil
+	}
+	rawPrimaryInfo, ok := metadata["primary_info"]
+	if !ok {
+		return nil
+	}
+	primaryInfoMap, ok := rawPrimaryInfo.(map[string]any)
+	if !ok {
+		return nil
+	}
+	isPrimary, ok := primaryInfoMap["is_primary"].(bool)
+	if !ok {
+		return nil
+	}
+	order := 0
+	switch value := primaryInfoMap["order"].(type) {
+	case float64:
+		order = int(value)
+	case int:
+		order = value
+	}
+	return &coreauth.PrimaryInfo{IsPrimary: isPrimary, Order: order}
 }
 
 // SynthesizeGeminiVirtualAuths creates virtual Auth entries for multi-project Gemini credentials.
@@ -233,6 +279,15 @@ func SynthesizeGeminiVirtualAuths(primary *coreauth.Auth, metadata map[string]an
 		// Propagate note from primary auth to virtual auths
 		if noteVal, hasNote := primary.Attributes["note"]; hasNote && noteVal != "" {
 			attrs["note"] = noteVal
+		}
+		// Propagate billing_class from primary auth to virtual auths
+		if billingClassVal, hasBillingClass := primary.Attributes["billing_class"]; hasBillingClass && billingClassVal != "" {
+			attrs["billing_class"] = billingClassVal
+		}
+		for k, v := range primary.Attributes {
+			if strings.HasPrefix(k, "header:") && strings.TrimSpace(v) != "" {
+				attrs[k] = v
+			}
 		}
 		metadataCopy := map[string]any{
 			"email":             email,
@@ -305,6 +360,18 @@ func buildGeminiVirtualID(baseID, projectID string) string {
 	}
 	replacer := strings.NewReplacer("/", "_", "\\", "_", " ", "_")
 	return fmt.Sprintf("%s::%s", baseID, replacer.Replace(project))
+}
+
+func normalizeFileBillingClass(raw string) string {
+	normalized := strings.ToLower(strings.TrimSpace(raw))
+	switch normalized {
+	case "metered":
+		return "metered"
+	case "per_request", "per-request":
+		return "per-request"
+	default:
+		return ""
+	}
 }
 
 // extractExcludedModelsFromMetadata reads per-account excluded models from the OAuth JSON metadata.
