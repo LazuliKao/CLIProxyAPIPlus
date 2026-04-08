@@ -836,6 +836,21 @@ func (s *Service) ensureAuthDir() error {
 	return nil
 }
 
+func metaStringValue(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	if v, ok := metadata[key]; ok {
+		switch typed := v.(type) {
+		case string:
+			return strings.TrimSpace(typed)
+		case []byte:
+			return strings.TrimSpace(string(typed))
+		}
+	}
+	return ""
+}
+
 // registerModelsForAuth (re)binds provider models in the global registry using the core auth ID as client identifier.
 func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	if a == nil || a.ID == "" {
@@ -983,7 +998,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = executor.GitLabModelsFromAuth(a)
 		models = applyExcludedModels(models, excluded)
 	case "codebuddy":
-		models = registry.GetCodeBuddyModels()
+		models = registry.GetCodeBuddyModels(metaStringValue(a.Metadata, "domain"))
 		models = applyExcludedModels(models, excluded)
 	default:
 		// Handle OpenAI-compatibility providers by name using config
