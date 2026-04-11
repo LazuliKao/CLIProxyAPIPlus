@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -46,6 +47,40 @@ type ClaudeExecutor struct {
 const claudeToolPrefix = ""
 
 const defaultClaudeMaxTokens = 32000
+
+// oauthToolRenameMap maps OpenCode-style (lowercase) tool names to Claude Code-style
+// (TitleCase) names. Anthropic uses tool name fingerprinting to detect third-party
+// clients on OAuth traffic. Renaming to official names avoids extra-usage billing.
+// All tools are mapped to TitleCase equivalents to match Claude Code naming patterns.
+var oauthToolRenameMap = map[string]string{
+	"bash":         "Bash",
+	"read":         "Read",
+	"write":        "Write",
+	"edit":         "Edit",
+	"glob":         "Glob",
+	"grep":         "Grep",
+	"task":         "Task",
+	"webfetch":     "WebFetch",
+	"todowrite":    "TodoWrite",
+	"question":     "Question",
+	"skill":        "Skill",
+	"ls":           "LS",
+	"todoread":     "TodoRead",
+	"notebookedit": "NotebookEdit",
+}
+
+// oauthToolRenameReverseMap is the inverse of oauthToolRenameMap for response decoding.
+var oauthToolRenameReverseMap = func() map[string]string {
+	m := make(map[string]string, len(oauthToolRenameMap))
+	for k, v := range oauthToolRenameMap {
+		m[v] = k
+	}
+	return m
+}()
+
+// oauthToolsToRemove lists tool names that must be stripped from OAuth requests
+// even after remapping. Currently empty — all tools are mapped instead of removed.
+var oauthToolsToRemove = map[string]bool{}
 
 // Anthropic-compatible upstreams may reject or even crash when Claude models
 // omit max_tokens. Prefer registered model metadata before using a fallback.
@@ -880,9 +915,6 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 			baseBetas += ",oauth-2025-04-20"
 		}
 	}
-	if !strings.Contains(baseBetas, "interleaved-thinking") {
-		baseBetas += ",interleaved-thinking-2025-05-14"
-	}
 
 	hasClaude1MHeader := false
 	if ginHeaders != nil {
@@ -990,9 +1022,12 @@ func applyClaudeToolPrefix(body []byte, prefix string) []byte {
 		return body
 	}
 
-	// Collect built-in tool names from the authoritative fallback seed list and
-	// augment it with any typed built-ins present in the current request body.
-	builtinTools := helps.AugmentClaudeBuiltinToolRegistry(body, nil)
+	// Collect built-in tool names (those with a non-empty "type" field) so we can
+	// skip them consistently in both tools and message history.
+	builtinTools := map[string]bool{}
+	for _, name := range []string{"web_search", "code_execution", "text_editor", "computer"} {
+		builtinTools[name] = true
+	}
 
 	if tools := gjson.GetBytes(body, "tools"); tools.Exists() && tools.IsArray() {
 		tools.ForEach(func(index, tool gjson.Result) bool {
@@ -1067,6 +1102,206 @@ func applyClaudeToolPrefix(body []byte, prefix string) []byte {
 	}
 
 	return body
+}
+
+// remapOAuthToolNames renames third-party tool names to Claude Code equivalents
+// and removes tools without an official counterpart. This prevents Anthropic from
+// fingerprinting the request as a third-party client via tool naming patterns.
+//
+// It operates on: tools[].name, tool_choice.name, and all tool_use/tool_reference
+// references in messages. Removed tools' corresponding tool_result blocks are preserved
+// (they just become orphaned, which is safe for Claude).
+func remapOAuthToolNames(body []byte) ([]byte, bool) {
+	renamed := false
+	// 1. Rewrite tools array in a single pass (if present).
+	// IMPORTANT: do not mutate names first and then rebuild from an older gjson
+	// snapshot. gjson results are snapshots of the original bytes; rebuilding from a
+	// stale snapshot will preserve removals but overwrite renamed names back to their
+	// original lowercase values.
+	tools := gjson.GetBytes(body, "tools")
+	if tools.Exists() && tools.IsArray() {
+
+		var toolsJSON strings.Builder
+		toolsJSON.WriteByte('[')
+		toolCount := 0
+		tools.ForEach(func(_, tool gjson.Result) bool {
+			// Keep Anthropic built-in tools (web_search, code_execution, etc.) unchanged.
+			if tool.Get("type").Exists() && tool.Get("type").String() != "" {
+				if toolCount > 0 {
+					toolsJSON.WriteByte(',')
+				}
+				toolsJSON.WriteString(tool.Raw)
+				toolCount++
+				return true
+			}
+
+			name := tool.Get("name").String()
+			if oauthToolsToRemove[name] {
+				return true
+			}
+
+			toolJSON := tool.Raw
+			if newName, ok := oauthToolRenameMap[name]; ok && newName != name {
+				updatedTool, err := sjson.Set(toolJSON, "name", newName)
+				if err == nil {
+					toolJSON = updatedTool
+					renamed = true
+				}
+			}
+
+			if toolCount > 0 {
+				toolsJSON.WriteByte(',')
+			}
+			toolsJSON.WriteString(toolJSON)
+			toolCount++
+			return true
+		})
+		toolsJSON.WriteByte(']')
+		body, _ = sjson.SetRawBytes(body, "tools", []byte(toolsJSON.String()))
+	}
+
+	// 2. Rename tool_choice if it references a known tool
+	toolChoiceType := gjson.GetBytes(body, "tool_choice.type").String()
+	if toolChoiceType == "tool" {
+		tcName := gjson.GetBytes(body, "tool_choice.name").String()
+		if oauthToolsToRemove[tcName] {
+			// The chosen tool was removed from the tools array, so drop tool_choice to
+			// keep the payload internally consistent and fall back to normal auto tool use.
+			body, _ = sjson.DeleteBytes(body, "tool_choice")
+		} else if newName, ok := oauthToolRenameMap[tcName]; ok && newName != tcName {
+			body, _ = sjson.SetBytes(body, "tool_choice.name", newName)
+			renamed = true
+		}
+	}
+
+	// 3. Rename tool references in messages
+	messages := gjson.GetBytes(body, "messages")
+	if messages.Exists() && messages.IsArray() {
+		messages.ForEach(func(msgIndex, msg gjson.Result) bool {
+			content := msg.Get("content")
+			if !content.Exists() || !content.IsArray() {
+				return true
+			}
+			content.ForEach(func(contentIndex, part gjson.Result) bool {
+				partType := part.Get("type").String()
+				switch partType {
+				case "tool_use":
+					name := part.Get("name").String()
+					if newName, ok := oauthToolRenameMap[name]; ok && newName != name {
+						path := fmt.Sprintf("messages.%d.content.%d.name", msgIndex.Int(), contentIndex.Int())
+						body, _ = sjson.SetBytes(body, path, newName)
+						renamed = true
+					}
+				case "tool_reference":
+					toolName := part.Get("tool_name").String()
+					if newName, ok := oauthToolRenameMap[toolName]; ok && newName != toolName {
+						path := fmt.Sprintf("messages.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int())
+						body, _ = sjson.SetBytes(body, path, newName)
+						renamed = true
+					}
+				case "tool_result":
+					// Handle nested tool_reference blocks inside tool_result.content[]
+					toolID := part.Get("tool_use_id").String()
+					_ = toolID // tool_use_id stays as-is
+					nestedContent := part.Get("content")
+					if nestedContent.Exists() && nestedContent.IsArray() {
+						nestedContent.ForEach(func(nestedIndex, nestedPart gjson.Result) bool {
+							if nestedPart.Get("type").String() == "tool_reference" {
+								nestedToolName := nestedPart.Get("tool_name").String()
+								if newName, ok := oauthToolRenameMap[nestedToolName]; ok && newName != nestedToolName {
+									nestedPath := fmt.Sprintf("messages.%d.content.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int(), nestedIndex.Int())
+									body, _ = sjson.SetBytes(body, nestedPath, newName)
+									renamed = true
+								}
+							}
+							return true
+						})
+					}
+				}
+				return true
+			})
+			return true
+		})
+	}
+
+	return body, renamed
+}
+
+// reverseRemapOAuthToolNames reverses the tool name mapping for non-stream responses.
+// It maps Claude Code TitleCase names back to the original lowercase names so the
+// downstream client receives tool names it recognizes.
+func reverseRemapOAuthToolNames(body []byte) []byte {
+	content := gjson.GetBytes(body, "content")
+	if !content.Exists() || !content.IsArray() {
+		return body
+	}
+	content.ForEach(func(index, part gjson.Result) bool {
+		partType := part.Get("type").String()
+		switch partType {
+		case "tool_use":
+			name := part.Get("name").String()
+			if origName, ok := oauthToolRenameReverseMap[name]; ok {
+				path := fmt.Sprintf("content.%d.name", index.Int())
+				body, _ = sjson.SetBytes(body, path, origName)
+			}
+		case "tool_reference":
+			toolName := part.Get("tool_name").String()
+			if origName, ok := oauthToolRenameReverseMap[toolName]; ok {
+				path := fmt.Sprintf("content.%d.tool_name", index.Int())
+				body, _ = sjson.SetBytes(body, path, origName)
+			}
+		}
+		return true
+	})
+	return body
+}
+
+// reverseRemapOAuthToolNamesFromStreamLine reverses the tool name mapping for SSE stream lines.
+func reverseRemapOAuthToolNamesFromStreamLine(line []byte) []byte {
+	payload := helps.JSONPayload(line)
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return line
+	}
+
+	contentBlock := gjson.GetBytes(payload, "content_block")
+	if !contentBlock.Exists() {
+		return line
+	}
+
+	blockType := contentBlock.Get("type").String()
+	var updated []byte
+	var err error
+
+	switch blockType {
+	case "tool_use":
+		name := contentBlock.Get("name").String()
+		if origName, ok := oauthToolRenameReverseMap[name]; ok {
+			updated, err = sjson.SetBytes(payload, "content_block.name", origName)
+			if err != nil {
+				return line
+			}
+		} else {
+			return line
+		}
+	case "tool_reference":
+		toolName := contentBlock.Get("tool_name").String()
+		if origName, ok := oauthToolRenameReverseMap[toolName]; ok {
+			updated, err = sjson.SetBytes(payload, "content_block.tool_name", origName)
+			if err != nil {
+				return line
+			}
+		} else {
+			return line
+		}
+	default:
+		return line
+	}
+
+	trimmed := bytes.TrimSpace(line)
+	if bytes.HasPrefix(trimmed, []byte("data:")) {
+		return append([]byte("data: "), updated...)
+	}
+	return updated
 }
 
 func stripClaudeToolPrefixFromResponse(body []byte, prefix string) []byte {
@@ -1430,6 +1665,182 @@ func countCacheControls(payload []byte) int {
 	return count
 }
 
+func parsePayloadObject(payload []byte) (map[string]any, bool) {
+	if len(payload) == 0 {
+		return nil, false
+	}
+	var root map[string]any
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return nil, false
+	}
+	return root, true
+}
+
+func marshalPayloadObject(original []byte, root map[string]any) []byte {
+	if root == nil {
+		return original
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return original
+	}
+	return out
+}
+
+func asObject(v any) (map[string]any, bool) {
+	obj, ok := v.(map[string]any)
+	return obj, ok
+}
+
+func asArray(v any) ([]any, bool) {
+	arr, ok := v.([]any)
+	return arr, ok
+}
+
+func countCacheControlsMap(root map[string]any) int {
+	count := 0
+
+	if system, ok := asArray(root["system"]); ok {
+		for _, item := range system {
+			if obj, ok := asObject(item); ok {
+				if _, exists := obj["cache_control"]; exists {
+					count++
+				}
+			}
+		}
+	}
+
+	if tools, ok := asArray(root["tools"]); ok {
+		for _, item := range tools {
+			if obj, ok := asObject(item); ok {
+				if _, exists := obj["cache_control"]; exists {
+					count++
+				}
+			}
+		}
+	}
+
+	if messages, ok := asArray(root["messages"]); ok {
+		for _, msg := range messages {
+			msgObj, ok := asObject(msg)
+			if !ok {
+				continue
+			}
+			content, ok := asArray(msgObj["content"])
+			if !ok {
+				continue
+			}
+			for _, item := range content {
+				if obj, ok := asObject(item); ok {
+					if _, exists := obj["cache_control"]; exists {
+						count++
+					}
+				}
+			}
+		}
+	}
+
+	return count
+}
+
+func normalizeTTLForBlock(obj map[string]any, seen5m *bool) bool {
+	ccRaw, exists := obj["cache_control"]
+	if !exists {
+		return false
+	}
+	cc, ok := asObject(ccRaw)
+	if !ok {
+		*seen5m = true
+		return false
+	}
+	ttlRaw, ttlExists := cc["ttl"]
+	ttl, ttlIsString := ttlRaw.(string)
+	if !ttlExists || !ttlIsString || ttl != "1h" {
+		*seen5m = true
+		return false
+	}
+	if *seen5m {
+		delete(cc, "ttl")
+		return true
+	}
+	return false
+}
+
+func findLastCacheControlIndex(arr []any) int {
+	last := -1
+	for idx, item := range arr {
+		obj, ok := asObject(item)
+		if !ok {
+			continue
+		}
+		if _, exists := obj["cache_control"]; exists {
+			last = idx
+		}
+	}
+	return last
+}
+
+func stripCacheControlExceptIndex(arr []any, preserveIdx int, excess *int) {
+	for idx, item := range arr {
+		if *excess <= 0 {
+			return
+		}
+		obj, ok := asObject(item)
+		if !ok {
+			continue
+		}
+		if _, exists := obj["cache_control"]; exists && idx != preserveIdx {
+			delete(obj, "cache_control")
+			*excess--
+		}
+	}
+}
+
+func stripAllCacheControl(arr []any, excess *int) {
+	for _, item := range arr {
+		if *excess <= 0 {
+			return
+		}
+		obj, ok := asObject(item)
+		if !ok {
+			continue
+		}
+		if _, exists := obj["cache_control"]; exists {
+			delete(obj, "cache_control")
+			*excess--
+		}
+	}
+}
+
+func stripMessageCacheControl(messages []any, excess *int) {
+	for _, msg := range messages {
+		if *excess <= 0 {
+			return
+		}
+		msgObj, ok := asObject(msg)
+		if !ok {
+			continue
+		}
+		content, ok := asArray(msgObj["content"])
+		if !ok {
+			continue
+		}
+		for _, item := range content {
+			if *excess <= 0 {
+				return
+			}
+			obj, ok := asObject(item)
+			if !ok {
+				continue
+			}
+			if _, exists := obj["cache_control"]; exists {
+				delete(obj, "cache_control")
+				*excess--
+			}
+		}
+	}
+}
+
 // normalizeCacheControlTTL ensures cache_control TTL values don't violate the
 // prompt-caching-scope-2026-01-05 ordering constraint: a 1h-TTL block must not
 // appear after a 5m-TTL block anywhere in the evaluation order.
@@ -1442,75 +1853,58 @@ func countCacheControls(payload []byte) int {
 // Strategy: walk all cache_control blocks in evaluation order. Once a 5m block
 // is seen, strip ttl from ALL subsequent 1h blocks (downgrading them to 5m).
 func normalizeCacheControlTTL(payload []byte) []byte {
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	root, ok := parsePayloadObject(payload)
+	if !ok {
 		return payload
 	}
 
-	original := payload
 	seen5m := false
 	modified := false
 
-	processBlock := func(path string, obj gjson.Result) {
-		cc := obj.Get("cache_control")
-		if !cc.Exists() {
-			return
-		}
-		if !cc.IsObject() {
-			seen5m = true
-			return
-		}
-		ttl := cc.Get("ttl")
-		if ttl.Type != gjson.String || ttl.String() != "1h" {
-			seen5m = true
-			return
-		}
-		if !seen5m {
-			return
-		}
-		ttlPath := path + ".cache_control.ttl"
-		updated, errDel := sjson.DeleteBytes(payload, ttlPath)
-		if errDel != nil {
-			return
-		}
-		payload = updated
-		modified = true
-	}
-
-	tools := gjson.GetBytes(payload, "tools")
-	if tools.IsArray() {
-		tools.ForEach(func(idx, item gjson.Result) bool {
-			processBlock(fmt.Sprintf("tools.%d", int(idx.Int())), item)
-			return true
-		})
-	}
-
-	system := gjson.GetBytes(payload, "system")
-	if system.IsArray() {
-		system.ForEach(func(idx, item gjson.Result) bool {
-			processBlock(fmt.Sprintf("system.%d", int(idx.Int())), item)
-			return true
-		})
-	}
-
-	messages := gjson.GetBytes(payload, "messages")
-	if messages.IsArray() {
-		messages.ForEach(func(msgIdx, msg gjson.Result) bool {
-			content := msg.Get("content")
-			if !content.IsArray() {
-				return true
+	if tools, ok := asArray(root["tools"]); ok {
+		for _, tool := range tools {
+			if obj, ok := asObject(tool); ok {
+				if normalizeTTLForBlock(obj, &seen5m) {
+					modified = true
+				}
 			}
-			content.ForEach(func(itemIdx, item gjson.Result) bool {
-				processBlock(fmt.Sprintf("messages.%d.content.%d", int(msgIdx.Int()), int(itemIdx.Int())), item)
-				return true
-			})
-			return true
-		})
+		}
+	}
+
+	if system, ok := asArray(root["system"]); ok {
+		for _, item := range system {
+			if obj, ok := asObject(item); ok {
+				if normalizeTTLForBlock(obj, &seen5m) {
+					modified = true
+				}
+			}
+		}
+	}
+
+	if messages, ok := asArray(root["messages"]); ok {
+		for _, msg := range messages {
+			msgObj, ok := asObject(msg)
+			if !ok {
+				continue
+			}
+			content, ok := asArray(msgObj["content"])
+			if !ok {
+				continue
+			}
+			for _, item := range content {
+				if obj, ok := asObject(item); ok {
+					if normalizeTTLForBlock(obj, &seen5m) {
+						modified = true
+					}
+				}
+			}
+		}
 	}
 
 	if !modified {
-		return original
+		return payload
 	}
-	return payload
+	return marshalPayloadObject(payload, root)
 }
 
 // enforceCacheControlLimit removes excess cache_control blocks from a payload
@@ -1530,166 +1924,64 @@ func normalizeCacheControlTTL(payload []byte) []byte {
 //	Phase 4: remaining system blocks (last system).
 //	Phase 5: remaining tool blocks (last tool).
 func enforceCacheControlLimit(payload []byte, maxBlocks int) []byte {
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	root, ok := parsePayloadObject(payload)
+	if !ok {
 		return payload
 	}
 
-	total := countCacheControls(payload)
+	total := countCacheControlsMap(root)
 	if total <= maxBlocks {
 		return payload
 	}
 
 	excess := total - maxBlocks
 
-	system := gjson.GetBytes(payload, "system")
-	if system.IsArray() {
-		lastIdx := -1
-		system.ForEach(func(idx, item gjson.Result) bool {
-			if item.Get("cache_control").Exists() {
-				lastIdx = int(idx.Int())
-			}
-			return true
-		})
-		if lastIdx >= 0 {
-			system.ForEach(func(idx, item gjson.Result) bool {
-				if excess <= 0 {
-					return false
-				}
-				i := int(idx.Int())
-				if i == lastIdx {
-					return true
-				}
-				if !item.Get("cache_control").Exists() {
-					return true
-				}
-				path := fmt.Sprintf("system.%d.cache_control", i)
-				updated, errDel := sjson.DeleteBytes(payload, path)
-				if errDel != nil {
-					return true
-				}
-				payload = updated
-				excess--
-				return true
-			})
-		}
+	var system []any
+	if arr, ok := asArray(root["system"]); ok {
+		system = arr
+	}
+	var tools []any
+	if arr, ok := asArray(root["tools"]); ok {
+		tools = arr
+	}
+	var messages []any
+	if arr, ok := asArray(root["messages"]); ok {
+		messages = arr
+	}
+
+	if len(system) > 0 {
+		stripCacheControlExceptIndex(system, findLastCacheControlIndex(system), &excess)
 	}
 	if excess <= 0 {
-		return payload
+		return marshalPayloadObject(payload, root)
 	}
 
-	tools := gjson.GetBytes(payload, "tools")
-	if tools.IsArray() {
-		lastIdx := -1
-		tools.ForEach(func(idx, item gjson.Result) bool {
-			if item.Get("cache_control").Exists() {
-				lastIdx = int(idx.Int())
-			}
-			return true
-		})
-		if lastIdx >= 0 {
-			tools.ForEach(func(idx, item gjson.Result) bool {
-				if excess <= 0 {
-					return false
-				}
-				i := int(idx.Int())
-				if i == lastIdx {
-					return true
-				}
-				if !item.Get("cache_control").Exists() {
-					return true
-				}
-				path := fmt.Sprintf("tools.%d.cache_control", i)
-				updated, errDel := sjson.DeleteBytes(payload, path)
-				if errDel != nil {
-					return true
-				}
-				payload = updated
-				excess--
-				return true
-			})
-		}
+	if len(tools) > 0 {
+		stripCacheControlExceptIndex(tools, findLastCacheControlIndex(tools), &excess)
 	}
 	if excess <= 0 {
-		return payload
+		return marshalPayloadObject(payload, root)
 	}
 
-	messages := gjson.GetBytes(payload, "messages")
-	if messages.IsArray() {
-		messages.ForEach(func(msgIdx, msg gjson.Result) bool {
-			if excess <= 0 {
-				return false
-			}
-			content := msg.Get("content")
-			if !content.IsArray() {
-				return true
-			}
-			content.ForEach(func(itemIdx, item gjson.Result) bool {
-				if excess <= 0 {
-					return false
-				}
-				if !item.Get("cache_control").Exists() {
-					return true
-				}
-				path := fmt.Sprintf("messages.%d.content.%d.cache_control", int(msgIdx.Int()), int(itemIdx.Int()))
-				updated, errDel := sjson.DeleteBytes(payload, path)
-				if errDel != nil {
-					return true
-				}
-				payload = updated
-				excess--
-				return true
-			})
-			return true
-		})
+	if len(messages) > 0 {
+		stripMessageCacheControl(messages, &excess)
 	}
 	if excess <= 0 {
-		return payload
+		return marshalPayloadObject(payload, root)
 	}
 
-	system = gjson.GetBytes(payload, "system")
-	if system.IsArray() {
-		system.ForEach(func(idx, item gjson.Result) bool {
-			if excess <= 0 {
-				return false
-			}
-			if !item.Get("cache_control").Exists() {
-				return true
-			}
-			path := fmt.Sprintf("system.%d.cache_control", int(idx.Int()))
-			updated, errDel := sjson.DeleteBytes(payload, path)
-			if errDel != nil {
-				return true
-			}
-			payload = updated
-			excess--
-			return true
-		})
+	if len(system) > 0 {
+		stripAllCacheControl(system, &excess)
 	}
 	if excess <= 0 {
-		return payload
+		return marshalPayloadObject(payload, root)
 	}
 
-	tools = gjson.GetBytes(payload, "tools")
-	if tools.IsArray() {
-		tools.ForEach(func(idx, item gjson.Result) bool {
-			if excess <= 0 {
-				return false
-			}
-			if !item.Get("cache_control").Exists() {
-				return true
-			}
-			path := fmt.Sprintf("tools.%d.cache_control", int(idx.Int()))
-			updated, errDel := sjson.DeleteBytes(payload, path)
-			if errDel != nil {
-				return true
-			}
-			payload = updated
-			excess--
-			return true
-		})
+	if len(tools) > 0 {
+		stripAllCacheControl(tools, &excess)
 	}
 
-	return payload
+	return marshalPayloadObject(payload, root)
 }
 
 // injectMessagesCacheControl adds cache_control to the second-to-last user turn for multi-turn caching.
