@@ -107,6 +107,12 @@ func (e *CodeBuddyExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
 
+	// 处理Responses API请求格式
+	if from == sdktranslator.FromString("openai-responses") {
+		// CodeBuddy支持原生OpenAI Responses API格式，直接透传
+		to = sdktranslator.FromString("openai-responses")
+	}
+
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
@@ -213,6 +219,12 @@ func (e *CodeBuddyExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
+
+	// 处理Responses API请求格式
+	if from == sdktranslator.FromString("openai-responses") {
+		// CodeBuddy支持原生OpenAI Responses API格式，直接透传
+		to = sdktranslator.FromString("openai-responses")
+	}
 
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {

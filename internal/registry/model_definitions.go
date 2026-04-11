@@ -157,7 +157,7 @@ func GetCodeBuddyModels(domain string) []*ModelInfo {
 				Description:         "OpenAI 旗舰编码模型，擅长长程任务",
 				ContextLength:       272000,
 				MaxCompletionTokens: 72000,
-				SupportedEndpoints:  []string{"/chat/completions"},
+				SupportedEndpoints:  []string{"/responses"},
 				Thinking:            &ThinkingSupport{ZeroAllowed: true},
 			},
 			{
@@ -170,7 +170,7 @@ func GetCodeBuddyModels(domain string) []*ModelInfo {
 				Description:         "OpenAI 代码专用模型，非常擅长处理复杂的编码任务",
 				ContextLength:       272000,
 				MaxCompletionTokens: 72000,
-				SupportedEndpoints:  []string{"/chat/completions"},
+				SupportedEndpoints:  []string{"/chat/completions", "/responses"},
 				Thinking:            &ThinkingSupport{ZeroAllowed: true},
 			},
 			{
@@ -183,7 +183,7 @@ func GetCodeBuddyModels(domain string) []*ModelInfo {
 				Description:         "OpenAI 代码专用模型，非常擅长处理复杂的编码任务",
 				ContextLength:       272000,
 				MaxCompletionTokens: 72000,
-				SupportedEndpoints:  []string{"/chat/completions"},
+				SupportedEndpoints:  []string{"/chat/completions", "/responses"},
 				Thinking:            &ThinkingSupport{ZeroAllowed: true},
 			},
 			{
@@ -196,7 +196,7 @@ func GetCodeBuddyModels(domain string) []*ModelInfo {
 				Description:         "OpenAI 旗舰编码模型，擅长长程任务",
 				ContextLength:       272000,
 				MaxCompletionTokens: 72000,
-				SupportedEndpoints:  []string{"/chat/completions"},
+				SupportedEndpoints:  []string{"/chat/completions", "/responses"},
 				Thinking:            &ThinkingSupport{ZeroAllowed: true},
 			},
 			{
@@ -209,7 +209,7 @@ func GetCodeBuddyModels(domain string) []*ModelInfo {
 				Description:         "OpenAI 旗舰模型，适合规划、调试、编码等任务",
 				ContextLength:       272000,
 				MaxCompletionTokens: 72000,
-				SupportedEndpoints:  []string{"/chat/completions"},
+				SupportedEndpoints:  []string{"/chat/completions", "/responses"},
 				Thinking:            &ThinkingSupport{ZeroAllowed: true},
 			},
 			{
@@ -222,7 +222,7 @@ func GetCodeBuddyModels(domain string) []*ModelInfo {
 				Description:         "OpenAI 最新的编码专用模型，适合大型、有挑战性的编码任务",
 				ContextLength:       272000,
 				MaxCompletionTokens: 72000,
-				SupportedEndpoints:  []string{"/chat/completions"},
+				SupportedEndpoints:  []string{"/chat/completions", "/responses"},
 				Thinking:            &ThinkingSupport{ZeroAllowed: true},
 			},
 			{
