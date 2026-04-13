@@ -550,10 +550,10 @@ func (e *GitHubCopilotExecutor) applyHeaders(r *http.Request, apiToken string, b
 	r.Header.Set("X-Github-Api-Version", copilotGitHubAPIVer)
 	r.Header.Set("X-Request-Id", uuid.NewString())
 
-	initiator := "user"
-	if isAgentInitiated(body) {
-		initiator = "agent"
-	}
+	// initiator := "user"
+	// if isAgentInitiated(body) {
+	initiator := "agent"
+	// }
 	r.Header.Set("X-Initiator", initiator)
 }
 
